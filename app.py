@@ -97,33 +97,24 @@ def geocode_villages(village_tuple):
 
 @st.cache_data(ttl=86400)
 def fetch_nigeria_lga_geojson():
-    """Auto-fetch Nigeria LGA boundaries with multiple fallback URLs"""
+    """Auto-fetch Nigeria LGA boundaries with fallback"""
     urls = [
-        # HDX (Humanitarian Data Exchange) - most reliable for Nigeria
-        "https://data.humdata.org/dataset/cod-ab-nga/resource/68f266d4-6d2e-4c6e-8c6d-7c6f6e6d6c6b/download/nga_admbnda_adm2_ocha_20230307.geojson",
-        # GeoBoundaries API (open license)
-        "https://geoboundaries.org/api/v3/geojson/?ISO=NGA&ADM=ADM2",
-        # Fallback: Simplified Kano State LGAs
-        "https://raw.githubusercontent.com/nigeria-geo/lgas/main/kano_state_lgas.geojson"
+        "https://data.humdata.org/dataset/nigeria-administrative-boundaries-levels-0-3/resource/xxx/download/nga_admbnda_adm2_ocha.geojson",
+        "https://geoboundaries.org/api/v3/geojson/?ISO=NGA&ADM=ADM2&format=geojson",
     ]
     
     for url in urls:
         try:
-            resp = requests.get(url, timeout=20, headers={'User-Agent': 'FFGH-Dashboard/1.0'})
-            resp.raise_for_status()
-            data = resp.json()
-            if "features" in data and len(data["features"]) > 0:
-                return data
-        except Exception as e:
-            st.warning(f"⚠️ Failed to load LGA from {url.split('/')[2]}: {str(e)[:60]}")
+            resp = requests.get(url, timeout=15, headers={'User-Agent': 'FFGH-Dashboard'})
+            if resp.status_code == 200 and "features" in resp.json():
+                return resp.json()
+        except:
             continue
-    
-    st.info("💡 LGA boundaries not auto-loaded. Dashboard works without them, or upload manually below.")
     return None
 
 @st.cache_data
 def assign_lgas_to_villages(village_coords_tuple, lga_geojson_str):
-    """Spatial join: assign each village to an LGA using point-in-polygon"""
+    """Spatial join: assign each village to an LGA"""
     if not village_coords_tuple or not lga_geojson_str:
         return {}
     
@@ -150,7 +141,7 @@ def assign_lgas_to_villages(village_coords_tuple, lga_geojson_str):
         if not coords:
             lga_mapping[village] = "Unassigned"
             continue
-        pt = Point(coords[1], coords[0])  # lon, lat
+        pt = Point(coords[1], coords[0])
         matched = False
         for j, poly in enumerate(lga_polygons):
             if poly.contains(pt):
@@ -265,29 +256,60 @@ def main():
     st.title("💉 FFGH Ruwan Bore Immunization Dashboard")
     st.markdown("*Track coverage, identify zero-dose children, and prioritize outreach in Nigeria*")
 
-    uploaded_file = st.sidebar.file_uploader("📤 Upload CHEW Log (Excel/CSV)", type=["xlsx", "xls", "csv"])
+    # ===== SIDEBAR UPLOADERS =====
+    st.sidebar.header("📤 Upload Files")
+    
+    # 1. Main data file uploader
+    uploaded_file = st.sidebar.file_uploader(
+        "📊 CHEW Log (Excel/CSV)",
+        type=["xlsx", "xls", "csv"],
+        help="Upload your CHEW log export from KoBoToolbox"
+    )
+    
     if not uploaded_file:
         st.info("👆 Please upload your CHEW log file to activate the dashboard.")
-        return
+        st.stop()
 
+    # 2. LGA GeoJSON uploader (right after Excel uploader)
+    st.sidebar.subheader("🗺️ LGA Boundaries (Optional)")
+    st.sidebar.markdown("*Upload Nigeria LGA GeoJSON for administrative mapping*")
+    
+    lga_geojson_file = st.sidebar.file_uploader(
+        "📂 Upload LGA GeoJSON",
+        type=["geojson", "json"],
+        help="Download from: https://data.humdata.org/dataset/cod-ab-nga"
+    )
+    
+    lga_geojson = None
+    if lga_geojson_file:
+        try:
+            lga_geojson = json.load(lga_geojson_file)
+            st.sidebar.success("✅ LGA boundaries loaded!")
+        except Exception as e:
+            st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
+    else:
+        st.sidebar.info("💡 Dashboard works without LGA boundaries")
+    
+    # Sheet selector for Excel
     sheet_name = None
     if uploaded_file.name.endswith(('.xlsx', '.xls')):
         sheet_names = get_sheet_names(uploaded_file)
         if sheet_names:
             sheet_name = st.sidebar.selectbox("📑 Select Sheet", sheet_names, help="Choose which sheet to analyze")
         else:
-            st.error("❌ No sheets found in Excel file")
-            return
+            st.sidebar.error("❌ No sheets found")
+            st.stop()
 
+    # Process data
     with st.spinner("Processing & auto-cleaning data..."):
         df, vax_cols, provided_cols, chew_col = process_data(uploaded_file, sheet_name)
     
     if df.empty:
         st.error("❌ No valid data found after cleaning.")
-        return
+        st.stop()
     if not vax_cols and not provided_cols:
         st.warning("⚠️ No vaccination columns detected.")
-        return
+        st.stop()
 
     # ===== SIDEBAR FILTERS =====
     st.sidebar.header("🔍 Filters")
@@ -329,7 +351,11 @@ def main():
     st.sidebar.markdown("*⚠️ Never merge these sources. Historical data is for screening only.*")
     
     if provided_cols:
-        data_source = st.sidebar.radio("🔍 Which data to analyze?", ["✅ Verifiable (Injections Provided)", "📝 Historical Recall (Caregiver Report)"], index=0)
+        data_source = st.sidebar.radio(
+            "🔍 Which data to analyze?",
+            ["✅ Verifiable (Injections Provided)", "📝 Historical Recall (Caregiver Report)"],
+            index=0
+        )
     else:
         data_source = "📝 Historical Recall (Caregiver Report)"
         st.sidebar.warning("⚠️ Only historical recall data available.")
@@ -346,7 +372,7 @@ def main():
     st.info(source_banner)
     if not active_vax_cols:
         st.warning("⚠️ No columns found for the selected data source.")
-        return
+        st.stop()
 
     vaccine_options = {v.replace(active_prefix, "").replace("_", " "): v for v in active_vax_cols}
     default_idx = next((i for i, label in enumerate(vaccine_options.keys()) if "MCV 1" in label or "Measles 1" in label), 0)
@@ -362,8 +388,6 @@ def main():
     total = len(df_f)
 
     # ===== LGA ASSIGNMENT & AGGREGATION =====
-    lga_geojson = fetch_nigeria_lga_geojson()
-    lga_mapping = {}
     selected_lga_filter = "All"
     
     if village_col in df_f.columns and lga_geojson:
@@ -385,7 +409,7 @@ def main():
         st.subheader("📊 Key Metrics")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("📋 Total Records", f"{total:,}")
-        if chew_col: c4.metric("👩‍️ Active CHEWs", df_f[chew_col].nunique() if chew_col in df_f.columns else 0)
+        if chew_col: c4.metric("👩‍⚕️ Active CHEWs", df_f[chew_col].nunique() if chew_col in df_f.columns else 0)
         
         bcg_col = "Vax_BCG" if "Vax_BCG" in df_f.columns else None
         opv0_col = next((c for c in df_f.columns if "OPV 0" in c), None)
@@ -428,7 +452,7 @@ def main():
 
         st.markdown("---")
         st.subheader("🚨 Priority Areas for Outreach")
-        st.info("ℹ️ Shows villages with <50% coverage based on your selected data source. 0.0% means no verifiable doses recorded.")
+        st.info("ℹ️ Shows villages with <50% coverage based on your selected data source.")
         if village_col in df_f.columns and selected_vax in df_f.columns:
             vax_cov = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
             vax_cov['coverage'] = (vax_cov['sum'] / vax_cov['count'] * 100).round(1)
@@ -449,7 +473,7 @@ def main():
         st.markdown("*Automatically maps villages to Local Government Areas using spatial analysis.*")
         
         if "LGA" not in df_f.columns or df_f["LGA"].isna().all():
-            st.info("ℹ️ LGA mapping unavailable. Ensure villages can be geocoded and LGA GeoJSON loads successfully.")
+            st.info("ℹ️ LGA mapping unavailable. Upload LGA GeoJSON in the sidebar to enable this feature.")
         else:
             lga_agg = df_f.groupby("LGA").agg({
                 selected_vax: ['sum', 'count'],
@@ -476,21 +500,6 @@ def main():
     with tab3:
         st.subheader("🗺️ Interactive Coverage Map")
         st.markdown("*Map uses OpenStreetMap geocoding. LGA boundaries provide administrative context.*")
-        
-        with st.expander("📂 Upload LGA GeoJSON (Optional Fallback)", expanded=lga_geojson is None):
-            st.markdown("""
-            **📥 Download Nigeria LGA GeoJSON:**
-            1. Go to [HDX Nigeria Administrative Boundaries](https://data.humdata.org/dataset/cod-ab-nga)
-            2. Download the `nga_admbnda_adm2_ocha_20230307.geojson` file
-            3. Upload it below
-            """)
-            lga_file = st.file_uploader("📤 Upload Nigeria LGA GeoJSON", type=["geojson", "json"], key="lga_manual_upload")
-            if lga_file:
-                try:
-                    lga_geojson = json.load(lga_file)
-                    st.success("✅ LGA boundaries loaded successfully!")
-                except Exception as e:
-                    st.error(f"❌ Invalid GeoJSON file: {e}")
         
         show_lga = st.checkbox("🔲 Show LGA Boundaries on Map", value=False, disabled=lga_geojson is None)
         
