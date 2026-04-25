@@ -97,7 +97,6 @@ def geocode_villages(village_tuple):
     progress.empty()
     return coords
 
-# ================= ROUTE OPTIMIZATION =================
 def solve_tsp_route(coords_dict, start_village=None):
     """Nearest Neighbor + 2-Opt TSP solver for outreach routing"""
     villages = list(coords_dict.keys())
@@ -105,12 +104,10 @@ def solve_tsp_route(coords_dict, start_village=None):
     if len(villages) < 2:
         return villages, 0, 0
     
-    # Find start index
     start_idx = 0
     if start_village and start_village in villages:
         start_idx = villages.index(start_village)
         
-    # Nearest Neighbor
     n = len(villages)
     visited = [False] * n
     visited[start_idx] = True
@@ -132,10 +129,8 @@ def solve_tsp_route(coords_dict, start_village=None):
         total_dist += min_dist
         current = nearest
     
-    # Return to start
     total_dist += geodesic(coords[route[-1]], coords[route[0]]).km
     
-    # 2-Opt Improvement
     improved = True
     iterations = 0
     while improved and iterations < 100:
@@ -349,7 +344,6 @@ def main():
         st.markdown("*Map uses OpenStreetMap geocoding. Toggle LGA boundaries for geographic context.*")
         
         if village_col in df_f.columns and selected_vax in df_f.columns:
-            # Geocode
             cov_df = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
             cov_df['coverage_pct'] = (cov_df['sum'] / cov_df['count'] * 100).round(1)
             cov_df = cov_df[cov_df['count'] >= 3]
@@ -363,7 +357,6 @@ def main():
                     m = folium.Map(location=[9.0, 8.5], zoom_start=7, tiles="CartoDB positron")
                     folium.LayerControl(collapsed=False).add_to(m)
                     
-                    # LGA Boundaries Layer
                     st.sidebar.subheader("🗺️ Map Layers")
                     show_lga = st.sidebar.checkbox("Show LGA Boundaries", value=False)
                     lga_file = st.sidebar.file_uploader("📂 Upload LGA GeoJSON", type=["geojson", "json"], key="lga_uploader")
@@ -384,7 +377,6 @@ def main():
                             st.sidebar.info("💡 Upload Nigeria LGA GeoJSON or fetch from HDX")
                             st.markdown("[📥 Download Nigeria LGA Boundaries (GeoJSON)](https://data.humdata.org/dataset/cod-ab-nga)")
                     
-                    # Coverage Markers
                     for _, row in cov_df.iterrows():
                         lat, lon = row['coords']
                         pct = row['coverage_pct']
@@ -407,7 +399,6 @@ def main():
                     m.fit_bounds([[sw - 0.2, ne - 0.2], [sw + 0.2, ne + 0.2]])
                     st_folium(m, width=700, height=500, returned_objects=[])
                     
-                    # Export coordinates
                     cov_export = cov_df.copy()
                     cov_export['Lat'] = cov_export['coords'].apply(lambda x: x[0])
                     cov_export['Lon'] = cov_export['coords'].apply(lambda x: x[1])
@@ -422,10 +413,9 @@ def main():
 
     with tab3:
         st.subheader("🚑 Outreach Route Optimizer")
-        st.markdown("*Calculates the most efficient travel sequence for CHEW teams. Uses straight-line distances × 1.3 road factor.*")
+        st.markdown("*Calculates the most efficient travel sequence for CHEW teams.*")
         
         if village_col in df_f.columns:
-            # Get villages with coordinates
             cov_df = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
             cov_df['coverage_pct'] = (cov_df['sum'] / cov_df['count'] * 100).round(1)
             cov_df = cov_df[cov_df['count'] >= 2]
@@ -439,7 +429,7 @@ def main():
                     target_type = st.sidebar.radio("Optimize for:", ["Cold Spots (<50%)", "All Villages", "Custom Selection"])
                     
                     if target_type == "Cold Spots (<50%)":
-                        target_villages = cov_df[cov_df['coverage_pct'] < 50][village_col].tolist()
+                        target_villages = [v for v in cov_df[cov_df['coverage_pct'] < 50][village_col].tolist() if v in valid_coords]
                     elif target_type == "All Villages":
                         target_villages = list(valid_coords.keys())
                     else:
@@ -449,22 +439,22 @@ def main():
                     avg_speed = st.sidebar.slider("Avg road speed (km/h)", 20, 50, 35, step=5)
                     time_per_stop = st.sidebar.slider("Time per village (min)", 10, 45, 20, step=5)
                     
-                    if st.sidebar.button(" Calculate Optimal Route", type="primary"):
+                    if st.sidebar.button("🧮 Calculate Optimal Route", type="primary"):
                         if len(target_villages) < 2:
                             st.warning("⚠️ Select at least 2 villages for routing.")
                         else:
                             subset_coords = {v: valid_coords[v] for v in target_villages if v in valid_coords}
-                            if not subset_coords:
-                                st.error("❌ No valid coordinates for selected villages.")
+                            
+                            if len(subset_coords) < 2:
+                                st.warning("⚠️ Need at least 2 geocoded villages for routing.")
                             else:
                                 with st.spinner("Optimizing route..."):
                                     route_order, total_dist, iterations = solve_tsp_route(subset_coords, start_point if start_point != "First village in route" else None)
                                     
-                                    # Road factor adjustment
                                     road_factor = 1.3
                                     road_dist = round(total_dist * road_factor, 2)
-                                    travel_time = road_dist / avg_speed  # hours
-                                    stop_time = len(route_order) * time_per_stop / 60  # hours
+                                    travel_time = road_dist / avg_speed
+                                    stop_time = len(route_order) * time_per_stop / 60
                                     total_time = travel_time + stop_time
                                     
                                     st.success(f"✅ Route optimized in {iterations} iterations")
@@ -473,7 +463,6 @@ def main():
                                     c2.metric("🛣️ Est. Road Distance", f"{road_dist} km")
                                     c3.metric("⏱️ Est. Total Time", f"{total_time:.1f} hrs")
                                     
-                                    # Route table
                                     route_df = pd.DataFrame({
                                         "Sequence": range(1, len(route_order) + 1),
                                         "Village": route_order,
@@ -482,7 +471,6 @@ def main():
                                         "Coverage %": [cov_df.set_index(village_col).loc[v, 'coverage_pct'] for v in route_order]
                                     })
                                     
-                                    # Calculate cumulative distance & ETA
                                     cum_dist = 0
                                     current_time = 0
                                     cum_dists = []
@@ -506,11 +494,9 @@ def main():
                                     csv_route = route_df.to_csv(index=False).encode("utf-8")
                                     st.download_button("⬇️ Download Route Plan (CSV)", csv_route, "outreach_route_plan.csv", "text/csv")
                                     
-                                    # Draw route on map
                                     m_route = folium.Map(location=[subset_coords[route_order[0]][0], subset_coords[route_order[0]][1]], zoom_start=10)
                                     folium.LayerControl().add_to(m_route)
                                     
-                                    # Add markers
                                     for i, v in enumerate(route_order):
                                         lat, lon = subset_coords[v]
                                         folium.Marker(
@@ -519,7 +505,6 @@ def main():
                                             icon=folium.Icon(color="blue" if i == 0 else "green" if i == len(route_order)-1 else "orange", prefix="fa", icon=str(i+1))
                                         ).add_to(m_route)
                                     
-                                    # Draw polyline
                                     route_coords = [subset_coords[v] for v in route_order] + [subset_coords[route_order[0]]]
                                     folium.PolyLine(
                                         route_coords,
@@ -530,14 +515,12 @@ def main():
                                     ).add_to(m_route)
                                     
                                     st_folium(m_route, width=700, height=500)
-                                else:
-                                    st.warning("⚠️ Need at least 2 geocoded villages for routing.")
-                            else:
-                                st.info("ℹ️ Select villages to generate route.")
-                        else:
-                            st.info("ℹ️ Insufficient village data for routing.")
                 else:
-                    st.info("ℹ️ Not enough data for route optimization.")
+                    st.info("ℹ️ Not enough geocoded villages for routing.")
+            else:
+                st.info("ℹ️ Insufficient data for routing.")
+        else:
+            st.info("ℹ️ Village data missing.")
 
     st.markdown("---")
     st.subheader("📋 Filtered Records")
