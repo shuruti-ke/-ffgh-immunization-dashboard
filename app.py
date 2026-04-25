@@ -18,31 +18,32 @@ def get_sheet_names(uploaded_file):
         return []
 
 @st.cache_data
-def parse_messy_date(date_val):
-    """Handle multiple date formats found in CHEW logs"""
-    if pd.isna(date_val):
+def parse_robust_date(date_val):
+    """Handle multiple date formats with strict fallback"""
+    if pd.isna(date_val) or date_val == '':
         return pd.NaT
     
     date_str = str(date_val).strip()
     
-    # Try common formats
+    # Try common formats in order of likelihood
     formats = [
-        "%Y-%m-%d",           # 2026-04-06
-        "%d/%m/%Y %H:%M",     # 6/3/26 11:48
-        "%d/%m/%Y %H:%M:%S",  # 22/03/2026 10:59:04
-        "%Y%m%d",             # 20260406
+        "%Y-%m-%d",           # 2026-04-06 (most common)
+        "%Y/%m/%d",           # 2026/04/06
+        "%d/%m/%Y",           # 06/04/2026
         "%d-%m-%Y",           # 06-04-2026
+        "%Y%m%d",             # 20260406
     ]
     
     for fmt in formats:
         try:
-            return pd.to_datetime(date_str, format=fmt)
+            return pd.to_datetime(date_str, format=fmt, errors='raise')
         except:
             continue
     
-    # Fallback: try pandas auto-parse
+    # Final fallback: pandas auto-parse (may be slow but catches edge cases)
     try:
-        return pd.to_datetime(date_str, errors='coerce')
+        parsed = pd.to_datetime(date_str, errors='coerce')
+        return parsed if pd.notna(parsed) else pd.NaT
     except:
         return pd.NaT
 
@@ -62,16 +63,37 @@ def process_data(uploaded_file, sheet_name=None):
     df.columns = df.columns.str.replace("Which of the following injections did you provide? /", "Provided_")
     df.columns = df.columns.str.replace("For which illness is treatment necessary?/", "Illness_")
     
-    # Parse dates - try multiple columns
-    date_candidates = ['start', 'Start', 'date', 'Date', 'submission_time', '_submission_time']
-    date_col = next((c for c in date_candidates if c in df.columns), None)
+    # ===== ROBUST DATE PARSING =====
+    # Try to find date column by name OR by position (first column is often date)
+    date_col = None
+    date_candidates = ['start', 'Start', 'date', 'Date', 'submission_time', '_submission_time', 'submission_date']
+    
+    # First try by name
+    for col in date_candidates:
+        if col in df.columns:
+            date_col = col
+            break
+    
+    # If not found, try first column (common in ODK exports)
+    if not date_col and len(df.columns) > 0:
+        first_col = df.columns[0]
+        # Check if first column looks like dates
+        sample = df[first_col].dropna().head(10)
+        if len(sample) > 0 and sample.astype(str).str.match(r'\d{4}-\d{2}-\d{2}').any():
+            date_col = first_col
     
     if date_col:
-        df['date'] = df[date_col].apply(parse_messy_date)
-        df = df[df['date'].notna()]
+        df['date'] = df[date_col].apply(parse_robust_date)
+        # Keep only rows with valid dates for filtering (but don't drop from main df)
+        valid_dates = df['date'].notna()
+        if valid_dates.sum() == 0:
+            st.warning("⚠️ No valid dates found. Date filters disabled.")
+            df['date'] = pd.NaT
+        else:
+            df = df[valid_dates].copy()  # Filter to valid dates only
     else:
         df['date'] = pd.NaT
-        st.warning("⚠️ No valid date column detected. Date filters will be disabled.")
+        st.warning("⚠️ No date column detected. Date filters will be disabled.")
     
     # Ensure vaccine columns are numeric (0/1)
     vax_cols = [c for c in df.columns if c.startswith("Vax_")]
@@ -96,13 +118,6 @@ def main():
     uploaded_file = st.sidebar.file_uploader("📤 Upload CHEW Log (Excel/CSV)", type=["xlsx", "xls", "csv"])
     if not uploaded_file:
         st.info("👆 Please upload your CHEW log file to activate the dashboard.")
-        st.markdown("""
-        ### 📋 Expected columns:
-        - `Village / Settlement`
-        - `CHEW Name`  
-        - Date column (`start`, `date`, etc.)
-        - Vaccine columns like `Vax_BCG`, `Vax_Oral Polio Vaccine (OPV) 0`, etc.
-        """)
         return
 
     # Sheet selector for Excel files
@@ -110,11 +125,7 @@ def main():
     if uploaded_file.name.endswith(('.xlsx', '.xls')):
         sheet_names = get_sheet_names(uploaded_file)
         if sheet_names:
-            sheet_name = st.sidebar.selectbox(
-                "📑 Select Sheet",
-                sheet_names,
-                help="Choose which sheet to analyze"
-            )
+            sheet_name = st.sidebar.selectbox("📑 Select Sheet", sheet_names, help="Choose which sheet to analyze")
         else:
             st.error("❌ No sheets found in Excel file")
             return
@@ -151,41 +162,63 @@ def main():
     else:
         selected_chew = "All"
     
-    # Date range picker
+    # ===== FIXED DATE RANGE PICKER =====
     st.sidebar.subheader("📅 Date Range")
+    
+    # Only enable date picker if we have valid dates
     if "date" in df.columns and df["date"].notna().any():
-        min_date = df["date"].min().date()
-        max_date = df["date"].max().date()
-        default_end = max_date
-        default_start = max(min_date, (datetime.now().date() - timedelta(days=30)))
-        
-        date_range = st.sidebar.date_input(
-            "Select dates",
-            value=[default_start, default_end],
-            min_value=min_date,
-            max_value=max_date,
-            help=f"Available: {min_date} to {max_date}"
-        )
-        
-        if isinstance(date_range, tuple) and len(date_range) == 2:
-            start_date, end_date = date_range
-            if start_date > end_date:
-                st.sidebar.error("⚠️ Start date must be before end date")
-                st.stop()
-        else:
-            st.sidebar.warning("Please select both start and end dates")
-            st.stop()
+        try:
+            min_date = df["date"].min().to_pydatetime().date()
+            max_date = df["date"].max().to_pydatetime().date()
+            
+            # Safety check: ensure dates are valid
+            if pd.isna(min_date) or pd.isna(max_date) or min_date > max_date:
+                raise ValueError("Invalid date range")
+            
+            # Smart defaults: last 30 days or full range
+            today = datetime.now().date()
+            default_end = min(max_date, today)  # Don't default to future dates
+            default_start = max(min_date, default_end - timedelta(days=30))
+            
+            date_range = st.sidebar.date_input(
+                "Select dates",
+                value=[default_start, default_end],
+                min_value=min_date,
+                max_value=max_date,
+                help=f"Available: {min_date} to {max_date}"
+            )
+            
+            # Validate range
+            if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+                start_date, end_date = date_range
+                if start_date > end_date:
+                    st.sidebar.error("⚠️ Start date must be before end date")
+                    st.stop()
+            else:
+                # Handle single date selection (Streamlit returns single date if only one picked)
+                if isinstance(date_range, datetime):
+                    start_date = end_date = date_range.date()
+                else:
+                    st.sidebar.warning("Please select a date range")
+                    st.stop()
+                    
+        except Exception as e:
+            st.sidebar.warning(f"⚠️ Date filter unavailable: {str(e)[:50]}")
+            start_date = end_date = None
     else:
+        st.sidebar.info("ℹ️ Date filtering disabled (no valid dates in data)")
         start_date = end_date = None
 
     # Vaccine selector
     if vax_cols:
         vaccine_options = {v.replace("Vax_", "").replace("_", " "): v for v in vax_cols}
-        selected_label = st.sidebar.selectbox(
-            "💉 Select Vaccine for Coverage", 
-            list(vaccine_options.keys()),
-            index=0 if "Measles (MCV) 1" in vaccine_options else 0
-        )
+        # Try to default to MCV1 if available
+        default_idx = 0
+        for i, label in enumerate(vaccine_options.keys()):
+            if "Measles" in label or "MCV" in label:
+                default_idx = i
+                break
+        selected_label = st.sidebar.selectbox("💉 Select Vaccine for Coverage", list(vaccine_options.keys()), index=default_idx)
         selected_vax = vaccine_options[selected_label]
     else:
         selected_vax = None
@@ -235,17 +268,12 @@ def main():
         if selected_vax and village_col in df_f.columns and selected_vax in df_f.columns:
             vax_cov = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
             vax_cov['coverage'] = (vax_cov['sum'] / vax_cov['count'] * 100).round(1)
-            vax_cov = vax_cov[vax_cov['count'] >= 3]
+            vax_cov = vax_cov[vax_cov['count'] >= 3]  # Filter small samples
             
             if not vax_cov.empty:
-                fig_bar = px.bar(
-                    vax_cov, 
-                    x=village_col, 
-                    y='coverage',
-                    color='coverage',
-                    color_continuous_scale=["#e74c3c", "#f39c12", "#27ae60"],
-                    title=f"{selected_label} Coverage by Village"
-                )
+                fig_bar = px.bar(vax_cov, x=village_col, y='coverage', color='coverage',
+                               color_continuous_scale=["#e74c3c", "#f39c12", "#27ae60"],
+                               title=f"{selected_label} Coverage by Village")
                 fig_bar.update_layout(xaxis_tickangle=-45, height=400)
                 st.plotly_chart(fig_bar, use_container_width=True)
             else:
@@ -260,13 +288,8 @@ def main():
             if not df_temp.empty:
                 df_temp.columns = ["vaccinated", "total"]
                 df_temp["coverage"] = (df_temp["vaccinated"] / df_temp["total"] * 100).round(1)
-                fig_line = px.line(
-                    df_temp.reset_index(), 
-                    x="date", 
-                    y="coverage",
-                    markers=True,
-                    title=f"{selected_label} Monthly Coverage Trend"
-                )
+                fig_line = px.line(df_temp.reset_index(), x="date", y="coverage", markers=True,
+                                 title=f"{selected_label} Monthly Coverage Trend")
                 fig_line.update_layout(height=400)
                 st.plotly_chart(fig_line, use_container_width=True)
             else:
@@ -295,20 +318,13 @@ def main():
     # ===== DATA TABLE & EXPORT =====
     st.markdown("---")
     st.subheader("📋 Filtered Records")
-    display_cols = [c for c in [
-        "date", village_col, chew_col, "Child's Name", "Caregiver Phone", "Age (in Years)"
-    ] if c in df_f.columns]
+    display_cols = [c for c in ["date", village_col, chew_col, "Child's Name", "Caregiver Phone", "Age (in Years)"] if c in df_f.columns]
     vax_display = [v for v in vax_cols[:6] if v in df_f.columns]
     
     if display_cols or vax_display:
         st.dataframe(df_f[display_cols + vax_display].head(100), use_container_width=True, height=300)
         csv = df_f.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download Filtered Data (CSV)",
-            csv,
-            f"ffgh_filtered_{datetime.now().strftime('%Y%m%d')}.csv",
-            "text/csv"
-        )
+        st.download_button("⬇️ Download Filtered Data (CSV)", csv, f"ffgh_filtered_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
     else:
         st.info("ℹ️ No recognizable columns to display")
 
