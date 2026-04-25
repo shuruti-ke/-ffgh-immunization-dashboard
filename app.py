@@ -3,7 +3,7 @@ import pandas as pd
 import plotly.express as px
 import numpy as np
 from datetime import datetime, timedelta
-import re, time, json, requests
+import re, time, json, requests, zipfile, io
 from rapidfuzz import fuzz
 from collections import Counter
 import folium
@@ -15,7 +15,7 @@ from shapely.geometry import Point, shape
 
 st.set_page_config(page_title="FFGH Immunization Dashboard", layout="wide", page_icon="💉")
 
-# ================= CACHE FUNCTIONS =================
+# ================= CACHE & HELPER FUNCTIONS =================
 
 @st.cache_data
 def get_sheet_names(uploaded_file):
@@ -51,12 +51,9 @@ def find_name_clusters(series, threshold=85):
     clean_series = series.dropna().astype(str).str.strip()
     unique_names = clean_series.unique()
     if len(unique_names) == 0: return {}
-    
-    assigned = set()
-    clusters = {}
+    assigned, clusters = set(), {}
     name_counts = Counter(clean_series)
     sorted_names = sorted(unique_names, key=lambda x: name_counts[x], reverse=True)
-    
     for name in sorted_names:
         if name in assigned: continue
         cluster = [name]
@@ -78,15 +75,12 @@ def apply_name_mapping(series, clusters):
 @st.cache_data(ttl=3600)
 def geocode_villages(village_tuple):
     geolocator = Nominatim(user_agent="ffgh_immunization_dashboard", timeout=10)
-    coords = {}
-    villages = list(village_tuple)
+    coords, villages = {}, list(village_tuple)
     progress = st.progress(0, text="Geocoding villages...")
-    
     for i, v in enumerate(villages):
         try:
             loc = geolocator.geocode(f"{v}, Kano State, Nigeria", exactly_one=True)
-            if not loc:
-                loc = geolocator.geocode(f"{v}, Nigeria", exactly_one=True)
+            if not loc: loc = geolocator.geocode(f"{v}, Nigeria", exactly_one=True)
             coords[v] = (loc.latitude, loc.longitude) if loc else None
         except (GeocoderTimedOut, GeocoderServiceError):
             coords[v] = None
@@ -97,7 +91,6 @@ def geocode_villages(village_tuple):
 
 @st.cache_data(ttl=86400)
 def fetch_nigeria_lga_geojson():
-    """Auto-fetch Nigeria LGA boundaries with fallback"""
     urls = [
         "https://data.humdata.org/dataset/nigeria-administrative-boundaries-levels-0-3/resource/xxx/download/nga_admbnda_adm2_ocha.geojson",
         "https://geoboundaries.org/api/v3/geojson/?ISO=NGA&ADM=ADM2&format=geojson",
@@ -107,16 +100,14 @@ def fetch_nigeria_lga_geojson():
             resp = requests.get(url, timeout=15, headers={'User-Agent': 'FFGH-Dashboard'})
             if resp.status_code == 200 and "features" in resp.json():
                 return resp.json()
-        except:
-            continue
+        except: continue
     return None
 
 @st.cache_data
 def assign_lgas_to_villages(village_coords_tuple, lga_geojson_str):
     if not village_coords_tuple or not lga_geojson_str: return {}
-    village_coords = dict(village_coords_tuple)
+    village_coords, lga_mapping = dict(village_coords_tuple), {}
     lga_geojson = json.loads(lga_geojson_str)
-    lga_mapping = {}
     lga_polygons, lga_names = [], []
     for feat in lga_geojson.get("features", []):
         try:
@@ -139,27 +130,18 @@ def assign_lgas_to_villages(village_coords_tuple, lga_geojson_str):
     return lga_mapping
 
 def solve_tsp_route(coords_dict, start_village=None):
-    villages = list(coords_dict.keys())
-    coords = list(coords_dict.values())
+    villages, coords = list(coords_dict.keys()), list(coords_dict.values())
     if len(villages) < 2: return villages, 0, 0
-    start_idx = 0
-    if start_village and start_village in villages: start_idx = villages.index(start_village)
-    n = len(villages)
-    visited = [False] * n
+    start_idx = villages.index(start_village) if start_village and start_village in villages else 0
+    n, visited, route, current, total_dist = len(villages), [False]*len(villages), [start_idx], start_idx, 0
     visited[start_idx] = True
-    route = [start_idx]
-    current = start_idx
-    total_dist = 0
     for _ in range(n - 1):
         nearest, min_dist = -1, float('inf')
         for j in range(n):
             if not visited[j]:
                 d = geodesic(coords[current], coords[j]).km
                 if d < min_dist: min_dist, nearest = d, j
-        visited[nearest] = True
-        route.append(nearest)
-        total_dist += min_dist
-        current = nearest
+        visited[nearest], route, total_dist, current = True, route + [nearest], total_dist + min_dist, nearest
     total_dist += geodesic(coords[route[-1]], coords[route[0]]).km
     improved, iterations = True, 0
     while improved and iterations < 100:
@@ -180,13 +162,15 @@ def process_data(uploaded_file, sheet_name=None):
     else:
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name, engine='openpyxl')
     
+    # Clean column names
     df.columns = df.columns.str.strip()
     df.columns = df.columns.str.replace(r":$", "", regex=True)
     df.columns = df.columns.str.replace("Has the child received any of the following immunizations? /", "Vax_", regex=False)
     df.columns = df.columns.str.replace("Which of the following injections did you provide? /", "Provided_", regex=False)
     df.columns = df.columns.str.replace("For which illness is treatment necessary?/", "Illness_", regex=False)
     
-    date_candidates = ['start', 'Start', 'date', 'Date', 'Enter the date', 'submission_time']
+    # Date parsing
+    date_candidates = ['Enter the date', 'start', 'Start', 'date', 'Date', 'submission_time']
     date_col = next((c for c in date_candidates if c in df.columns), None)
     if not date_col and len(df.columns) > 0:
         first_col = df.columns[0]
@@ -198,24 +182,26 @@ def process_data(uploaded_file, sheet_name=None):
     else:
         df['date'] = pd.NaT
         
+    # Fuzzy cleaning
     if "Village / Settlement" in df.columns:
         v_clusters = find_name_clusters(df["Village / Settlement"], threshold=85)
         if v_clusters: df["Village / Settlement"] = apply_name_mapping(df["Village / Settlement"], v_clusters)
-            
     chew_col = next((c for c in df.columns if "chew" in c.lower()), None)
     if chew_col:
         c_clusters = find_name_clusters(df[chew_col], threshold=90)
         if c_clusters: df[chew_col] = apply_name_mapping(df[chew_col], c_clusters)
     
+    # Separate vaccine sources
     vax_cols = [c for c in df.columns if c.startswith("Vax_")]
     provided_cols = [c for c in df.columns if c.startswith("Provided_")]
     for col in vax_cols + provided_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
     
+    # Deduplicate
     uuid_col = "uuid" if "uuid" in df.columns else "_uuid" if "_uuid" in df.columns else None
     if uuid_col: df = df.drop_duplicates(subset=[uuid_col], keep="last")
         
-    # ✅ CRITICAL FIX: Reset index to prevent pandas IndexingError
+    # ✅ CRITICAL: Reset index to prevent pandas IndexingError
     df = df.reset_index(drop=True)
     return df, vax_cols, provided_cols, chew_col
 
@@ -227,25 +213,48 @@ def main():
     # ===== SIDEBAR UPLOADERS =====
     st.sidebar.header("📤 Upload Files")
     uploaded_file = st.sidebar.file_uploader("📊 CHEW Log (Excel/CSV)", type=["xlsx", "xls", "csv"], help="Upload your CHEW log export")
-    
     if not uploaded_file:
         st.info("👆 Please upload your CHEW log file to activate the dashboard.")
         return
 
     st.sidebar.subheader("🗺️ LGA Boundaries (Optional)")
-    st.sidebar.markdown("*Upload Nigeria LGA GeoJSON for administrative mapping*")
-    lga_geojson_file = st.sidebar.file_uploader("📂 Upload LGA GeoJSON", type=["geojson", "json"], help="Download from: https://data.humdata.org/dataset/cod-ab-nga")
-    
+    upload_method = st.sidebar.radio("Upload method:", ["Single GeoJSON", "Multiple files / ZIP archive"], index=0)
     lga_geojson = None
-    if lga_geojson_file:
-        try:
-            lga_geojson = json.load(lga_geojson_file)
-            st.sidebar.success("✅ LGA boundaries loaded!")
-        except Exception as e:
-            st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
-    else:
-        st.sidebar.info("💡 Dashboard works without LGA boundaries")
     
+    if upload_method == "Single GeoJSON":
+        lga_file = st.sidebar.file_uploader("📂 Upload LGA GeoJSON", type=["geojson", "json"])
+        if lga_file:
+            try:
+                lga_geojson = json.load(lga_file)
+                st.sidebar.success(f"✅ Loaded: {lga_file.name}")
+            except Exception as e: st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
+    else:
+        uploaded_files = st.sidebar.file_uploader("📂 Upload GeoJSONs or ZIP", type=["geojson", "json", "zip"], accept_multiple_files=True)
+        if uploaded_files:
+            lga_geojson = {"type": "FeatureCollection", "features": []}
+            files_loaded = 0
+            for f in uploaded_files:
+                try:
+                    if f.name.endswith('.zip'):
+                        with zipfile.ZipFile(f, 'r') as zip_ref:
+                            for zf in zip_ref.namelist():
+                                if zf.endswith(('.geojson', '.json')):
+                                    with zip_ref.open(zf) as zf_data:
+                                        data = json.load(zf_data)
+                                        if "features" in data: lga_geojson["features"].extend(data["features"]); files_loaded += 1
+                    else:
+                        data = json.load(f)
+                        if "features" in data: lga_geojson["features"].extend(data["features"]); files_loaded += 1
+                except Exception as e: st.sidebar.warning(f"⚠️ Could not load {f.name}: {str(e)[:50]}")
+            if files_loaded > 0: st.sidebar.success(f"✅ Loaded {files_loaded} file(s) with {len(lga_geojson['features'])} features")
+            else: lga_geojson = None; st.sidebar.error("❌ No valid GeoJSON files found")
+
+    # Auto-fetch attempt in background
+    if lga_geojson is None:
+        lga_geojson = fetch_nigeria_lga_geojson()
+        if lga_geojson: st.sidebar.info("🌐 Auto-loaded LGA boundaries from open data source")
+
+    # Sheet selector
     sheet_name = None
     if uploaded_file.name.endswith(('.xlsx', '.xls')):
         sheet_names = get_sheet_names(uploaded_file)
@@ -255,27 +264,22 @@ def main():
             st.sidebar.error("❌ No sheets found")
             return
 
+    # Process data
     with st.spinner("Processing & auto-cleaning data..."):
         df, vax_cols, provided_cols, chew_col = process_data(uploaded_file, sheet_name)
     
-    if df.empty:
-        st.error("❌ No valid data found after cleaning.")
-        return
-    if not vax_cols and not provided_cols:
-        st.warning("⚠️ No vaccination columns detected.")
-        return
+    if df.empty: st.error("❌ No valid data found after cleaning."); return
+    if not vax_cols and not provided_cols: st.warning("⚠️ No vaccination columns detected."); return
 
     # ===== SIDEBAR FILTERS =====
     st.sidebar.header("🔍 Filters")
     village_col = "Village / Settlement"
     villages = sorted(df[village_col].dropna().unique().tolist()) if village_col in df.columns else []
     selected_village = st.sidebar.selectbox("🏘️ Village / Settlement", ["All"] + villages)
-        
     if chew_col:
         chews = sorted(df[chew_col].dropna().unique().tolist())
-        selected_chew = st.sidebar.selectbox("👩‍⚕️ CHEW", ["All"] + chews)
-    else:
-        selected_chew = "All"
+        selected_chew = st.sidebar.selectbox("👩‍️ CHEW", ["All"] + chews)
+    else: selected_chew = "All"
 
     st.sidebar.subheader("📅 Date Range")
     start_date = end_date = None
@@ -316,7 +320,7 @@ def main():
     selected_vax = vaccine_options[selected_label]
 
     # ===== APPLY FILTERS =====
-    # ✅ CRITICAL FIX: Align mask index with df index
+    # ✅ CRITICAL: Align mask index with df index
     mask = pd.Series(True, index=df.index)
     if selected_village != "All": mask &= (df[village_col] == selected_village)
     if selected_chew != "All" and chew_col: mask &= (df[chew_col] == selected_chew)
@@ -324,7 +328,7 @@ def main():
     df_f = df[mask].copy()
     total = len(df_f)
 
-    # ===== LGA ASSIGNMENT & AGGREGATION =====
+    # ===== LGA ASSIGNMENT =====
     selected_lga_filter = "All"
     if village_col in df_f.columns and lga_geojson:
         coords = geocode_villages(tuple(df_f[village_col].dropna().unique()))
