@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import re
 import time
 import json
+import requests
 from rapidfuzz import fuzz
 from collections import Counter
 import folium
@@ -98,7 +99,6 @@ def geocode_villages(village_tuple):
     return coords
 
 def solve_tsp_route(coords_dict, start_village=None):
-    """Nearest Neighbor + 2-Opt TSP solver for outreach routing"""
     villages = list(coords_dict.keys())
     coords = list(coords_dict.values())
     if len(villages) < 2:
@@ -157,12 +157,14 @@ def process_data(uploaded_file, sheet_name=None):
     else:
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name, engine='openpyxl')
     
+    # Clean column names
     df.columns = df.columns.str.strip()
     df.columns = df.columns.str.replace(r":$", "", regex=True)
     df.columns = df.columns.str.replace("Has the child received any of the following immunizations? /", "Vax_", regex=False)
     df.columns = df.columns.str.replace("Which of the following injections did you provide? /", "Provided_", regex=False)
     df.columns = df.columns.str.replace("For which illness is treatment necessary?/", "Illness_", regex=False)
     
+    # Date parsing
     date_candidates = ['start', 'Start', 'date', 'Date', 'Enter the date', 'submission_time']
     date_col = next((c for c in date_candidates if c in df.columns), None)
     if not date_col and len(df.columns) > 0:
@@ -176,6 +178,7 @@ def process_data(uploaded_file, sheet_name=None):
     else:
         df['date'] = pd.NaT
         
+    # Fuzzy cleaning for villages & CHEWs
     if "Village / Settlement" in df.columns:
         v_clusters = find_name_clusters(df["Village / Settlement"], threshold=85)
         if v_clusters:
@@ -187,15 +190,20 @@ def process_data(uploaded_file, sheet_name=None):
         if c_clusters:
             df[chew_col] = apply_name_mapping(df[chew_col], c_clusters)
     
+    # Separate vaccine columns by data source
     vax_cols = [c for c in df.columns if c.startswith("Vax_")]
-    for col in vax_cols:
+    provided_cols = [c for c in df.columns if c.startswith("Provided_")]
+    
+    # Ensure numeric
+    for col in vax_cols + provided_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
     
+    # Deduplicate by UUID
     uuid_col = "uuid" if "uuid" in df.columns else "_uuid" if "_uuid" in df.columns else None
     if uuid_col:
         df = df.drop_duplicates(subset=[uuid_col], keep="last")
         
-    return df, vax_cols, chew_col
+    return df, vax_cols, provided_cols, chew_col
 
 # ================= MAIN APP =================
 def main():
@@ -217,13 +225,13 @@ def main():
             return
 
     with st.spinner("Processing & auto-cleaning data..."):
-        df, vax_cols, chew_col = process_data(uploaded_file, sheet_name)
+        df, vax_cols, provided_cols, chew_col = process_data(uploaded_file, sheet_name)
     
     if df.empty:
         st.error("❌ No valid data found after cleaning.")
         return
-    if not vax_cols:
-        st.warning("⚠️ No vaccination columns detected. Check that immunization columns start with 'Vax_'")
+    if not vax_cols and not provided_cols:
+        st.warning("⚠️ No vaccination columns detected. Check that immunization columns start with 'Vax_' or 'Provided_'")
         return
 
     # ===== SIDEBAR FILTERS =====
@@ -264,9 +272,40 @@ def main():
         except Exception as e:
             st.sidebar.warning(f"⚠️ Date filter unavailable: {str(e)[:50]}")
 
-    vaccine_options = {v.replace("Vax_", "").replace("_", " "): v for v in vax_cols}
-    default_idx = next((i for i, label in enumerate(vaccine_options.keys()) if "Measles" in label or "MCV" in label), 0)
-    selected_label = st.sidebar.selectbox("💉 Select Vaccine for Coverage", list(vaccine_options.keys()), index=default_idx)
+    # ===== DATA SOURCE SEPARATION =====
+    st.sidebar.header("📊 Data Source Selection")
+    st.sidebar.markdown("*⚠️ Never merge these sources. Historical data is for screening only.*")
+    
+    if provided_cols:
+        data_source = st.sidebar.radio(
+            "🔍 Which data to analyze?",
+            ["✅ Verifiable (Injections Provided)", "📝 Historical Recall (Caregiver Report)"],
+            index=0,
+            help="Use 'Verifiable' for official coverage reporting and outreach planning"
+        )
+    else:
+        data_source = "📝 Historical Recall (Caregiver Report)"
+        st.sidebar.warning("⚠️ Only historical recall data available in this file.")
+        
+    if "Verifiable" in data_source:
+        active_prefix = "Provided_"
+        active_vax_cols = provided_cols
+        source_banner = "✅ Currently analyzing: VERIFIABLE DATA (CHEW-provided injections)"
+    else:
+        active_prefix = "Vax_"
+        active_vax_cols = vax_cols
+        source_banner = "📝 Currently analyzing: HISTORICAL RECALL (Caregiver-reported status)"
+        
+    st.info(source_banner)
+    
+    if not active_vax_cols:
+        st.warning("⚠️ No columns found for the selected data source.")
+        return
+
+    # Vaccine selector
+    vaccine_options = {v.replace(active_prefix, "").replace("_", " "): v for v in active_vax_cols}
+    default_idx = next((i for i, label in enumerate(vaccine_options.keys()) if "MCV 1" in label or "Measles 1" in label), 0)
+    selected_label = st.sidebar.selectbox("💉 Select Vaccine", list(vaccine_options.keys()), index=default_idx)
     selected_vax = vaccine_options[selected_label]
 
     # ===== APPLY FILTERS =====
@@ -284,10 +323,11 @@ def main():
         st.subheader("📊 Key Metrics")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("📋 Total Records", f"{total:,}")
-        if chew_col: c4.metric("👩‍⚕️ Active CHEWs", df_f[chew_col].nunique())
+        if chew_col: c4.metric("👩‍️ Active CHEWs", df_f[chew_col].nunique())
         
+        # Zero-dose uses historical data only (screening purpose)
         bcg_col = "Vax_BCG" if "Vax_BCG" in df_f.columns else None
-        opv0_col = next((c for c in df_f.columns if "OPV 0" in c or "Oral Polio Vaccine (OPV) 0" in c), None)
+        opv0_col = next((c for c in df_f.columns if "OPV 0" in c), None)
         if bcg_col and opv0_col and total > 0:
             zero_dose = df_f[(df_f[bcg_col] == 0) & (df_f[opv0_col] == 0)].shape[0]
             c2.metric("🚫 Zero-Dose Children", f"{zero_dose:,}", delta=f"{(zero_dose/total*100):.1f}%")
@@ -341,7 +381,21 @@ def main():
 
     with tab2:
         st.subheader("🗺️ Interactive Coverage Map")
-        st.markdown("*Map uses OpenStreetMap geocoding. Toggle LGA boundaries for geographic context.*")
+        st.markdown("*Map uses OpenStreetMap geocoding. LGA boundaries are optional for ward-level planning.*")
+        
+        with st.expander("🗺️ LGA Boundaries (Optional)", expanded=False):
+            st.info("💡 **What is this?** LGA = Local Government Area. Overlaying boundaries helps identify which administrative ward a village belongs to.")
+            st.markdown("**📥 Download Nigeria LGA GeoJSON:**")
+            st.download_button(
+                label="⬇️ Download LGA_Boundaries.geojson",
+                data=requests.get("https://raw.githubusercontent.com/CodeForAfrica/Nigeria-GeoJSON/main/lgas.geojson").content,
+                file_name="nigeria_lgas.geojson",
+                mime="application/geo+json"
+            )
+            st.caption("Upload the downloaded file below to overlay boundaries on the map.")
+            
+        lga_file = st.file_uploader("📂 Upload LGA GeoJSON (Optional)", type=["geojson", "json"], key="lga_uploader")
+        show_lga = st.checkbox("🔲 Show LGA Boundaries on Map", value=False, disabled=lga_file is None)
         
         if village_col in df_f.columns and selected_vax in df_f.columns:
             cov_df = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
@@ -357,25 +411,16 @@ def main():
                     m = folium.Map(location=[9.0, 8.5], zoom_start=7, tiles="CartoDB positron")
                     folium.LayerControl(collapsed=False).add_to(m)
                     
-                    st.sidebar.subheader("🗺️ Map Layers")
-                    show_lga = st.sidebar.checkbox("Show LGA Boundaries", value=False)
-                    lga_file = st.sidebar.file_uploader("📂 Upload LGA GeoJSON", type=["geojson", "json"], key="lga_uploader")
-                    
-                    if show_lga:
-                        if lga_file:
-                            try:
-                                lga_data = json.load(lga_file)
-                                folium.GeoJson(
-                                    lga_data, 
-                                    name="LGA Boundaries",
-                                    style_function=lambda x: {'fillColor': 'transparent', 'color': '#2c3e50', 'weight': 1.5, 'opacity': 0.8}
-                                ).add_to(m)
-                                st.sidebar.success("✅ LGA boundaries loaded")
-                            except Exception as e:
-                                st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
-                        else:
-                            st.sidebar.info("💡 Upload Nigeria LGA GeoJSON or fetch from HDX")
-                            st.markdown("[📥 Download Nigeria LGA Boundaries (GeoJSON)](https://data.humdata.org/dataset/cod-ab-nga)")
+                    if show_lga and lga_file:
+                        try:
+                            lga_data = json.load(lga_file)
+                            folium.GeoJson(
+                                lga_data, 
+                                name="LGA Boundaries",
+                                style_function=lambda x: {'fillColor': 'transparent', 'color': '#2c3e50', 'weight': 1.5, 'opacity': 0.8}
+                            ).add_to(m)
+                        except Exception as e:
+                            st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
                     
                     for _, row in cov_df.iterrows():
                         lat, lon = row['coords']
@@ -525,7 +570,7 @@ def main():
     st.markdown("---")
     st.subheader("📋 Filtered Records")
     display_cols = [c for c in ["date", village_col, chew_col, "Child's Name", "Caregiver Phone", "Age (in Years)"] if c in df_f.columns]
-    vax_display = [v for v in vax_cols[:6] if v in df_f.columns]
+    vax_display = [v for v in active_vax_cols[:6] if v in df_f.columns]
     if display_cols or vax_display:
         st.dataframe(df_f[display_cols + vax_display].head(100), use_container_width=True, height=300)
         csv = df_f.to_csv(index=False).encode("utf-8")
