@@ -6,3 +6,4 @@ rapidfuzz>=3.5.0
 folium>=0.15.0
 streamlit-folium>=0.15.0
 geopy>=2.4.0
+requests>=2.31.0
