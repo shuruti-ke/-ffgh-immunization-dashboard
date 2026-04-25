@@ -97,14 +97,29 @@ def geocode_villages(village_tuple):
 
 @st.cache_data(ttl=86400)
 def fetch_nigeria_lga_geojson():
-    url = "https://raw.githubusercontent.com/CodeForAfrica/Nigeria-GeoJSON/main/lgas.geojson"
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        st.warning(f"⚠️ Auto-load LGA boundaries failed: {e}")
-        return None
+    """Auto-fetch Nigeria LGA boundaries with multiple fallback URLs"""
+    urls = [
+        # HDX (Humanitarian Data Exchange) - most reliable for Nigeria
+        "https://data.humdata.org/dataset/cod-ab-nga/resource/68f266d4-6d2e-4c6e-8c6d-7c6f6e6d6c6b/download/nga_admbnda_adm2_ocha_20230307.geojson",
+        # GeoBoundaries API (open license)
+        "https://geoboundaries.org/api/v3/geojson/?ISO=NGA&ADM=ADM2",
+        # Fallback: Simplified Kano State LGAs
+        "https://raw.githubusercontent.com/nigeria-geo/lgas/main/kano_state_lgas.geojson"
+    ]
+    
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=20, headers={'User-Agent': 'FFGH-Dashboard/1.0'})
+            resp.raise_for_status()
+            data = resp.json()
+            if "features" in data and len(data["features"]) > 0:
+                return data
+        except Exception as e:
+            st.warning(f"⚠️ Failed to load LGA from {url.split('/')[2]}: {str(e)[:60]}")
+            continue
+    
+    st.info("💡 LGA boundaries not auto-loaded. Dashboard works without them, or upload manually below.")
+    return None
 
 @st.cache_data
 def assign_lgas_to_villages(village_coords_tuple, lga_geojson_str):
@@ -116,7 +131,6 @@ def assign_lgas_to_villages(village_coords_tuple, lga_geojson_str):
     lga_geojson = json.loads(lga_geojson_str)
     lga_mapping = {}
     
-    # Prepare LGA polygons
     lga_polygons = []
     lga_names = []
     for feat in lga_geojson.get("features", []):
@@ -414,17 +428,21 @@ def main():
 
         st.markdown("---")
         st.subheader("🚨 Priority Areas for Outreach")
+        st.info("ℹ️ Shows villages with <50% coverage based on your selected data source. 0.0% means no verifiable doses recorded.")
         if village_col in df_f.columns and selected_vax in df_f.columns:
             vax_cov = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
             vax_cov['coverage'] = (vax_cov['sum'] / vax_cov['count'] * 100).round(1)
+            vax_cov['unvaccinated'] = vax_cov['count'] - vax_cov['sum']
             vax_cov = vax_cov[vax_cov['count'] >= 3]
             cold = vax_cov[vax_cov['coverage'] < 50].sort_values('coverage')
             if not cold.empty:
                 st.warning(f"⚠️ {len(cold)} villages with <50% coverage need urgent attention:")
-                for _, row in cold.head(5).iterrows():
-                    st.markdown(f"- **{row[village_col]}**: {row['coverage']:.1f}% coverage ({int(row['count']-row['sum'])} unvaccinated)")
+                for _, row in cold.head(10).iterrows():
+                    st.markdown(f"- **{row[village_col]}**: {row['coverage']:.1f}% coverage ({int(row['unvaccinated'])} unvaccinated)")
             else:
                 st.success("✅ All villages with sufficient data have >50% coverage!")
+        else:
+            st.info("ℹ️ Select a vaccine to identify priority areas.")
 
     with tab2:
         st.subheader("🏛️ LGA-Level Coverage Aggregation")
@@ -457,9 +475,24 @@ def main():
 
     with tab3:
         st.subheader("🗺️ Interactive Coverage Map")
-        st.markdown("*Map uses OpenStreetMap geocoding. LGA boundaries are auto-loaded for ward-level context.*")
+        st.markdown("*Map uses OpenStreetMap geocoding. LGA boundaries provide administrative context.*")
         
-        show_lga = st.checkbox("🔲 Show LGA Boundaries (Auto-loaded)", value=False, disabled=lga_geojson is None)
+        with st.expander("📂 Upload LGA GeoJSON (Optional Fallback)", expanded=lga_geojson is None):
+            st.markdown("""
+            **📥 Download Nigeria LGA GeoJSON:**
+            1. Go to [HDX Nigeria Administrative Boundaries](https://data.humdata.org/dataset/cod-ab-nga)
+            2. Download the `nga_admbnda_adm2_ocha_20230307.geojson` file
+            3. Upload it below
+            """)
+            lga_file = st.file_uploader("📤 Upload Nigeria LGA GeoJSON", type=["geojson", "json"], key="lga_manual_upload")
+            if lga_file:
+                try:
+                    lga_geojson = json.load(lga_file)
+                    st.success("✅ LGA boundaries loaded successfully!")
+                except Exception as e:
+                    st.error(f"❌ Invalid GeoJSON file: {e}")
+        
+        show_lga = st.checkbox("🔲 Show LGA Boundaries on Map", value=False, disabled=lga_geojson is None)
         
         if village_col in df_f.columns and selected_vax in df_f.columns:
             cov_df = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
