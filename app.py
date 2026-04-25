@@ -3,10 +3,7 @@ import pandas as pd
 import plotly.express as px
 import numpy as np
 from datetime import datetime, timedelta
-import re
-import time
-import json
-import requests
+import re, time, json, requests
 from rapidfuzz import fuzz
 from collections import Counter
 import folium
@@ -14,10 +11,11 @@ from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from geopy.distance import geodesic
+from shapely.geometry import Point, shape
 
 st.set_page_config(page_title="FFGH Immunization Dashboard", layout="wide", page_icon="💉")
 
-# ================= HELPER FUNCTIONS =================
+# ================= CACHE FUNCTIONS =================
 
 @st.cache_data
 def get_sheet_names(uploaded_file):
@@ -82,7 +80,7 @@ def geocode_villages(village_tuple):
     geolocator = Nominatim(user_agent="ffgh_immunization_dashboard", timeout=10)
     coords = {}
     villages = list(village_tuple)
-    progress = st.progress(0)
+    progress = st.progress(0, text="Geocoding villages...")
     
     for i, v in enumerate(villages):
         try:
@@ -94,15 +92,67 @@ def geocode_villages(village_tuple):
             coords[v] = None
         progress.progress((i + 1) / len(villages))
         time.sleep(1.1)
-        
     progress.empty()
     return coords
+
+@st.cache_data(ttl=86400)
+def fetch_nigeria_lga_geojson():
+    url = "https://raw.githubusercontent.com/CodeForAfrica/Nigeria-GeoJSON/main/lgas.geojson"
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.warning(f"⚠️ Auto-load LGA boundaries failed: {e}")
+        return None
+
+@st.cache_data
+def assign_lgas_to_villages(village_coords_tuple, lga_geojson_str):
+    """Spatial join: assign each village to an LGA using point-in-polygon"""
+    if not village_coords_tuple or not lga_geojson_str:
+        return {}
+    
+    village_coords = dict(village_coords_tuple)
+    lga_geojson = json.loads(lga_geojson_str)
+    lga_mapping = {}
+    
+    # Prepare LGA polygons
+    lga_polygons = []
+    lga_names = []
+    for feat in lga_geojson.get("features", []):
+        try:
+            geom = shape(feat["geometry"])
+            if geom.is_valid:
+                lga_polygons.append(geom)
+                lga_names.append(feat["properties"].get("name", feat["properties"].get("LGA", "Unknown")))
+        except Exception:
+            continue
+            
+    if not lga_polygons:
+        return {}
+        
+    progress = st.progress(0, text="Assigning villages to LGAs...")
+    for i, (village, coords) in enumerate(village_coords.items()):
+        if not coords:
+            lga_mapping[village] = "Unassigned"
+            continue
+        pt = Point(coords[1], coords[0])  # lon, lat
+        matched = False
+        for j, poly in enumerate(lga_polygons):
+            if poly.contains(pt):
+                lga_mapping[village] = lga_names[j]
+                matched = True
+                break
+        if not matched:
+            lga_mapping[village] = "Unassigned"
+        progress.progress((i + 1) / len(village_coords))
+    progress.empty()
+    return lga_mapping
 
 def solve_tsp_route(coords_dict, start_village=None):
     villages = list(coords_dict.keys())
     coords = list(coords_dict.values())
-    if len(villages) < 2:
-        return villages, 0, 0
+    if len(villages) < 2: return villages, 0, 0
     
     start_idx = 0
     if start_village and start_village in villages:
@@ -128,7 +178,6 @@ def solve_tsp_route(coords_dict, start_village=None):
         route.append(nearest)
         total_dist += min_dist
         current = nearest
-    
     total_dist += geodesic(coords[route[-1]], coords[route[0]]).km
     
     improved = True
@@ -146,7 +195,6 @@ def solve_tsp_route(coords_dict, start_village=None):
                 if new_cost < old_cost:
                     route[i:j+1] = reversed(route[i:j+1])
                     improved = True
-                    
     return [villages[i] for i in route], round(total_dist, 2), iterations
 
 # ================= DATA PROCESSING =================
@@ -157,14 +205,12 @@ def process_data(uploaded_file, sheet_name=None):
     else:
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name, engine='openpyxl')
     
-    # Clean column names
     df.columns = df.columns.str.strip()
     df.columns = df.columns.str.replace(r":$", "", regex=True)
     df.columns = df.columns.str.replace("Has the child received any of the following immunizations? /", "Vax_", regex=False)
     df.columns = df.columns.str.replace("Which of the following injections did you provide? /", "Provided_", regex=False)
     df.columns = df.columns.str.replace("For which illness is treatment necessary?/", "Illness_", regex=False)
     
-    # Date parsing
     date_candidates = ['start', 'Start', 'date', 'Date', 'Enter the date', 'submission_time']
     date_col = next((c for c in date_candidates if c in df.columns), None)
     if not date_col and len(df.columns) > 0:
@@ -178,7 +224,6 @@ def process_data(uploaded_file, sheet_name=None):
     else:
         df['date'] = pd.NaT
         
-    # Fuzzy cleaning for villages & CHEWs
     if "Village / Settlement" in df.columns:
         v_clusters = find_name_clusters(df["Village / Settlement"], threshold=85)
         if v_clusters:
@@ -190,15 +235,11 @@ def process_data(uploaded_file, sheet_name=None):
         if c_clusters:
             df[chew_col] = apply_name_mapping(df[chew_col], c_clusters)
     
-    # Separate vaccine columns by data source
     vax_cols = [c for c in df.columns if c.startswith("Vax_")]
     provided_cols = [c for c in df.columns if c.startswith("Provided_")]
-    
-    # Ensure numeric
     for col in vax_cols + provided_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
     
-    # Deduplicate by UUID
     uuid_col = "uuid" if "uuid" in df.columns else "_uuid" if "_uuid" in df.columns else None
     if uuid_col:
         df = df.drop_duplicates(subset=[uuid_col], keep="last")
@@ -231,21 +272,18 @@ def main():
         st.error("❌ No valid data found after cleaning.")
         return
     if not vax_cols and not provided_cols:
-        st.warning("⚠️ No vaccination columns detected. Check that immunization columns start with 'Vax_' or 'Provided_'")
+        st.warning("⚠️ No vaccination columns detected.")
         return
 
     # ===== SIDEBAR FILTERS =====
     st.sidebar.header("🔍 Filters")
     village_col = "Village / Settlement"
-    if village_col in df.columns:
-        villages = sorted(df[village_col].dropna().unique().tolist())
-        selected_village = st.sidebar.selectbox("🏘️ Village / Settlement", ["All"] + villages)
-    else:
-        selected_village = "All"
+    villages = sorted(df[village_col].dropna().unique().tolist()) if village_col in df.columns else []
+    selected_village = st.sidebar.selectbox("🏘️ Village / Settlement", ["All"] + villages)
         
     if chew_col:
         chews = sorted(df[chew_col].dropna().unique().tolist())
-        selected_chew = st.sidebar.selectbox("👩‍⚕️ CHEW", ["All"] + chews)
+        selected_chew = st.sidebar.selectbox("👩‍️ CHEW", ["All"] + chews)
     else:
         selected_chew = "All"
 
@@ -277,15 +315,10 @@ def main():
     st.sidebar.markdown("*⚠️ Never merge these sources. Historical data is for screening only.*")
     
     if provided_cols:
-        data_source = st.sidebar.radio(
-            "🔍 Which data to analyze?",
-            ["✅ Verifiable (Injections Provided)", "📝 Historical Recall (Caregiver Report)"],
-            index=0,
-            help="Use 'Verifiable' for official coverage reporting and outreach planning"
-        )
+        data_source = st.sidebar.radio("🔍 Which data to analyze?", ["✅ Verifiable (Injections Provided)", "📝 Historical Recall (Caregiver Report)"], index=0)
     else:
         data_source = "📝 Historical Recall (Caregiver Report)"
-        st.sidebar.warning("⚠️ Only historical recall data available in this file.")
+        st.sidebar.warning("⚠️ Only historical recall data available.")
         
     if "Verifiable" in data_source:
         active_prefix = "Provided_"
@@ -297,12 +330,10 @@ def main():
         source_banner = "📝 Currently analyzing: HISTORICAL RECALL (Caregiver-reported status)"
         
     st.info(source_banner)
-    
     if not active_vax_cols:
         st.warning("⚠️ No columns found for the selected data source.")
         return
 
-    # Vaccine selector
     vaccine_options = {v.replace(active_prefix, "").replace("_", " "): v for v in active_vax_cols}
     default_idx = next((i for i, label in enumerate(vaccine_options.keys()) if "MCV 1" in label or "Measles 1" in label), 0)
     selected_label = st.sidebar.selectbox("💉 Select Vaccine", list(vaccine_options.keys()), index=default_idx)
@@ -316,16 +347,32 @@ def main():
     df_f = df[mask].copy()
     total = len(df_f)
 
+    # ===== LGA ASSIGNMENT & AGGREGATION =====
+    lga_geojson = fetch_nigeria_lga_geojson()
+    lga_mapping = {}
+    selected_lga_filter = "All"
+    
+    if village_col in df_f.columns and lga_geojson:
+        coords = geocode_villages(tuple(df_f[village_col].dropna().unique()))
+        valid_coords = {k: v for k, v in coords.items() if v is not None}
+        if valid_coords:
+            lga_mapping = assign_lgas_to_villages(tuple(valid_coords.items()), json.dumps(lga_geojson))
+            df_f["LGA"] = df_f[village_col].map(lga_mapping).fillna("Unassigned")
+            lgas = sorted(df_f["LGA"].dropna().unique().tolist())
+            selected_lga_filter = st.sidebar.selectbox("🏛️ Filter by LGA", ["All"] + lgas)
+            if selected_lga_filter != "All":
+                df_f = df_f[df_f["LGA"] == selected_lga_filter].copy()
+                total = len(df_f)
+
     # ===== TABS UI =====
-    tab1, tab2, tab3 = st.tabs(["📊 Analytics Dashboard", "🗺️ Coverage Map", "🚑 Outreach Route Planner"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Analytics", "🏛️ LGA Coverage", "🗺️ Map & Boundaries", "🚑 Route Planner"])
     
     with tab1:
         st.subheader("📊 Key Metrics")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("📋 Total Records", f"{total:,}")
-        if chew_col: c4.metric("👩‍️ Active CHEWs", df_f[chew_col].nunique())
+        if chew_col: c4.metric("👩‍️ Active CHEWs", df_f[chew_col].nunique() if chew_col in df_f.columns else 0)
         
-        # Zero-dose uses historical data only (screening purpose)
         bcg_col = "Vax_BCG" if "Vax_BCG" in df_f.columns else None
         opv0_col = next((c for c in df_f.columns if "OPV 0" in c), None)
         if bcg_col and opv0_col and total > 0:
@@ -380,22 +427,39 @@ def main():
                 st.success("✅ All villages with sufficient data have >50% coverage!")
 
     with tab2:
-        st.subheader("🗺️ Interactive Coverage Map")
-        st.markdown("*Map uses OpenStreetMap geocoding. LGA boundaries are optional for ward-level planning.*")
+        st.subheader("🏛️ LGA-Level Coverage Aggregation")
+        st.markdown("*Automatically maps villages to Local Government Areas using spatial analysis.*")
         
-        with st.expander("🗺️ LGA Boundaries (Optional)", expanded=False):
-            st.info("💡 **What is this?** LGA = Local Government Area. Overlaying boundaries helps identify which administrative ward a village belongs to.")
-            st.markdown("**📥 Download Nigeria LGA GeoJSON:**")
-            st.download_button(
-                label="⬇️ Download LGA_Boundaries.geojson",
-                data=requests.get("https://raw.githubusercontent.com/CodeForAfrica/Nigeria-GeoJSON/main/lgas.geojson").content,
-                file_name="nigeria_lgas.geojson",
-                mime="application/geo+json"
-            )
-            st.caption("Upload the downloaded file below to overlay boundaries on the map.")
+        if "LGA" not in df_f.columns or df_f["LGA"].isna().all():
+            st.info("ℹ️ LGA mapping unavailable. Ensure villages can be geocoded and LGA GeoJSON loads successfully.")
+        else:
+            lga_agg = df_f.groupby("LGA").agg({
+                selected_vax: ['sum', 'count'],
+                village_col: 'nunique'
+            }).reset_index()
+            lga_agg.columns = ["LGA", "Vaccinated", "Total", "Villages"]
+            lga_agg["Coverage %"] = (lga_agg["Vaccinated"] / lga_agg["Total"] * 100).round(1)
+            lga_agg["Unvaccinated"] = lga_agg["Total"] - lga_agg["Vaccinated"]
+            lga_agg = lga_agg.sort_values("Coverage %")
             
-        lga_file = st.file_uploader("📂 Upload LGA GeoJSON (Optional)", type=["geojson", "json"], key="lga_uploader")
-        show_lga = st.checkbox("🔲 Show LGA Boundaries on Map", value=False, disabled=lga_file is None)
+            c1, c2 = st.columns(2)
+            with c1:
+                fig_lga = px.bar(lga_agg, x="LGA", y="Coverage %", color="Coverage %",
+                               color_continuous_scale=["#e74c3c", "#f39c12", "#27ae60"],
+                               title=f"{selected_label} Coverage by LGA")
+                fig_lga.update_layout(xaxis_tickangle=-45, height=400)
+                st.plotly_chart(fig_lga, use_container_width=True)
+            with c2:
+                st.dataframe(lga_agg, use_container_width=True, height=400)
+                
+            csv_lga = lga_agg.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download LGA Coverage Report", csv_lga, "lga_coverage_report.csv", "text/csv")
+
+    with tab3:
+        st.subheader("🗺️ Interactive Coverage Map")
+        st.markdown("*Map uses OpenStreetMap geocoding. LGA boundaries are auto-loaded for ward-level context.*")
+        
+        show_lga = st.checkbox("🔲 Show LGA Boundaries (Auto-loaded)", value=False, disabled=lga_geojson is None)
         
         if village_col in df_f.columns and selected_vax in df_f.columns:
             cov_df = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
@@ -411,16 +475,14 @@ def main():
                     m = folium.Map(location=[9.0, 8.5], zoom_start=7, tiles="CartoDB positron")
                     folium.LayerControl(collapsed=False).add_to(m)
                     
-                    if show_lga and lga_file:
+                    if show_lga and lga_geojson:
                         try:
-                            lga_data = json.load(lga_file)
-                            folium.GeoJson(
-                                lga_data, 
-                                name="LGA Boundaries",
-                                style_function=lambda x: {'fillColor': 'transparent', 'color': '#2c3e50', 'weight': 1.5, 'opacity': 0.8}
+                            folium.GeoJson(lga_geojson, name="LGA Boundaries",
+                                style_function=lambda x: {'fillColor': 'transparent', 'color': '#2c3e50', 'weight': 1.5, 'opacity': 0.8},
+                                tooltip=folium.GeoJsonTooltip(fields=["name"], aliases=["LGA:"])
                             ).add_to(m)
                         except Exception as e:
-                            st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
+                            st.warning(f"⚠️ Failed to render LGA boundaries: {e}")
                     
                     for _, row in cov_df.iterrows():
                         lat, lon = row['coords']
@@ -456,7 +518,7 @@ def main():
         else:
             st.info("ℹ️ Select a vaccine and ensure village data is available.")
 
-    with tab3:
+    with tab4:
         st.subheader("🚑 Outreach Route Optimizer")
         st.markdown("*Calculates the most efficient travel sequence for CHEW teams.*")
         
@@ -489,7 +551,6 @@ def main():
                             st.warning("⚠️ Select at least 2 villages for routing.")
                         else:
                             subset_coords = {v: valid_coords[v] for v in target_villages if v in valid_coords}
-                            
                             if len(subset_coords) < 2:
                                 st.warning("⚠️ Need at least 2 geocoded villages for routing.")
                             else:
@@ -518,8 +579,7 @@ def main():
                                     
                                     cum_dist = 0
                                     current_time = 0
-                                    cum_dists = []
-                                    etas = []
+                                    cum_dists, etas = [], []
                                     for i in range(len(route_order)):
                                         if i == 0:
                                             cum_dist = 0
@@ -527,8 +587,7 @@ def main():
                                         else:
                                             d = geodesic(subset_coords[route_order[i-1]], subset_coords[route_order[i]]).km * road_factor
                                             cum_dist += d
-                                            travel_h = d / avg_speed
-                                            current_time += travel_h + (time_per_stop/60)
+                                            current_time += (d / avg_speed) + (time_per_stop/60)
                                         cum_dists.append(round(cum_dist, 2))
                                         etas.append(current_time)
                                         
@@ -541,24 +600,14 @@ def main():
                                     
                                     m_route = folium.Map(location=[subset_coords[route_order[0]][0], subset_coords[route_order[0]][1]], zoom_start=10)
                                     folium.LayerControl().add_to(m_route)
-                                    
                                     for i, v in enumerate(route_order):
                                         lat, lon = subset_coords[v]
-                                        folium.Marker(
-                                            [lat, lon],
-                                            popup=f"{i+1}. {v}",
+                                        folium.Marker([lat, lon], popup=f"{i+1}. {v}",
                                             icon=folium.Icon(color="blue" if i == 0 else "green" if i == len(route_order)-1 else "orange", prefix="fa", icon=str(i+1))
                                         ).add_to(m_route)
-                                    
-                                    route_coords = [subset_coords[v] for v in route_order] + [subset_coords[route_order[0]]]
-                                    folium.PolyLine(
-                                        route_coords,
-                                        color="#e74c3c",
-                                        weight=4,
-                                        opacity=0.8,
-                                        dash_array="10, 5"
+                                    folium.PolyLine([subset_coords[v] for v in route_order] + [subset_coords[route_order[0]]],
+                                        color="#e74c3c", weight=4, opacity=0.8, dash_array="10, 5"
                                     ).add_to(m_route)
-                                    
                                     st_folium(m_route, width=700, height=500)
                 else:
                     st.info("ℹ️ Not enough geocoded villages for routing.")
