@@ -74,18 +74,29 @@ def apply_name_mapping(series, clusters):
 
 @st.cache_data(ttl=3600)
 def geocode_villages(village_tuple):
-    geolocator = Nominatim(user_agent="ffgh_immunization_dashboard", timeout=10)
+    geolocator = Nominatim(user_agent="ffgh_immunization_dashboard", timeout=15)
     coords, villages = {}, list(village_tuple)
     progress = st.progress(0, text="Geocoding villages...")
+    
+    # Clean names for better matching
+    clean_map = {v: v.replace("/", " ").replace(",", "") for v in villages}
+    
     for i, v in enumerate(villages):
+        cleaned = clean_map[v]
         try:
-            loc = geolocator.geocode(f"{v}, Kano State, Nigeria", exactly_one=True)
-            if not loc: loc = geolocator.geocode(f"{v}, Nigeria", exactly_one=True)
+            # Try 3 search variations to maximize success
+            loc = geolocator.geocode(f"{cleaned}, Kano, Nigeria", exactly_one=True)
+            if not loc: loc = geolocator.geocode(f"{cleaned}, Nigeria", exactly_one=True)
+            if not loc: loc = geolocator.geocode(cleaned, country="Nigeria", exactly_one=True)
+            
             coords[v] = (loc.latitude, loc.longitude) if loc else None
-        except (GeocoderTimedOut, GeocoderServiceError):
+        except (GeocoderTimedOut, GeocoderServiceError) as e:
             coords[v] = None
+        except Exception as e:
+            coords[v] = None
+            
         progress.progress((i + 1) / len(villages))
-        time.sleep(1.1)
+        time.sleep(1.1) # Respect Nominatim rate limits
     progress.empty()
     return coords
 
@@ -201,7 +212,6 @@ def process_data(uploaded_file, sheet_name=None):
     uuid_col = "uuid" if "uuid" in df.columns else "_uuid" if "_uuid" in df.columns else None
     if uuid_col: df = df.drop_duplicates(subset=[uuid_col], keep="last")
         
-    # ✅ CRITICAL: Reset index to prevent pandas IndexingError
     df = df.reset_index(drop=True)
     return df, vax_cols, provided_cols, chew_col
 
@@ -218,41 +228,22 @@ def main():
         return
 
     st.sidebar.subheader("🗺️ LGA Boundaries (Optional)")
-    upload_method = st.sidebar.radio("Upload method:", ["Single GeoJSON", "Multiple files / ZIP archive"], index=0)
-    lga_geojson = None
+    st.sidebar.markdown("*Upload Nigeria LGA GeoJSON for administrative mapping. Auto-load often fails for specific regions.*")
     
-    if upload_method == "Single GeoJSON":
-        lga_file = st.sidebar.file_uploader("📂 Upload LGA GeoJSON", type=["geojson", "json"])
-        if lga_file:
-            try:
-                lga_geojson = json.load(lga_file)
-                st.sidebar.success(f"✅ Loaded: {lga_file.name}")
-            except Exception as e: st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
+    # Priority: Manual upload
+    lga_geojson = None
+    lga_file = st.sidebar.file_uploader("📂 Upload LGA GeoJSON", type=["geojson", "json"], help="Download from: https://data.humdata.org/dataset/cod-ab-nga")
+    
+    if lga_file:
+        try:
+            lga_geojson = json.load(lga_file)
+            st.sidebar.success("✅ LGA boundaries loaded successfully!")
+        except Exception as e: st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
     else:
-        uploaded_files = st.sidebar.file_uploader("📂 Upload GeoJSONs or ZIP", type=["geojson", "json", "zip"], accept_multiple_files=True)
-        if uploaded_files:
-            lga_geojson = {"type": "FeatureCollection", "features": []}
-            files_loaded = 0
-            for f in uploaded_files:
-                try:
-                    if f.name.endswith('.zip'):
-                        with zipfile.ZipFile(f, 'r') as zip_ref:
-                            for zf in zip_ref.namelist():
-                                if zf.endswith(('.geojson', '.json')):
-                                    with zip_ref.open(zf) as zf_data:
-                                        data = json.load(zf_data)
-                                        if "features" in data: lga_geojson["features"].extend(data["features"]); files_loaded += 1
-                    else:
-                        data = json.load(f)
-                        if "features" in data: lga_geojson["features"].extend(data["features"]); files_loaded += 1
-                except Exception as e: st.sidebar.warning(f"⚠️ Could not load {f.name}: {str(e)[:50]}")
-            if files_loaded > 0: st.sidebar.success(f"✅ Loaded {files_loaded} file(s) with {len(lga_geojson['features'])} features")
-            else: lga_geojson = None; st.sidebar.error("❌ No valid GeoJSON files found")
-
-    # Auto-fetch attempt in background
-    if lga_geojson is None:
+        # Fallback: Try auto-load
         lga_geojson = fetch_nigeria_lga_geojson()
         if lga_geojson: st.sidebar.info("🌐 Auto-loaded LGA boundaries from open data source")
+        else: st.sidebar.warning("💡 Auto-load failed. Please upload manually for LGA features.")
 
     # Sheet selector
     sheet_name = None
@@ -278,7 +269,7 @@ def main():
     selected_village = st.sidebar.selectbox("🏘️ Village / Settlement", ["All"] + villages)
     if chew_col:
         chews = sorted(df[chew_col].dropna().unique().tolist())
-        selected_chew = st.sidebar.selectbox("👩‍️ CHEW", ["All"] + chews)
+        selected_chew = st.sidebar.selectbox("👩‍⚕️ CHEW", ["All"] + chews)
     else: selected_chew = "All"
 
     st.sidebar.subheader("📅 Date Range")
@@ -320,7 +311,6 @@ def main():
     selected_vax = vaccine_options[selected_label]
 
     # ===== APPLY FILTERS =====
-    # ✅ CRITICAL: Align mask index with df index
     mask = pd.Series(True, index=df.index)
     if selected_village != "All": mask &= (df[village_col] == selected_village)
     if selected_chew != "All" and chew_col: mask &= (df[chew_col] == selected_chew)
@@ -429,28 +419,34 @@ def main():
             cov_df = cov_df[cov_df['count'] >= 3]
             if not cov_df.empty:
                 coords = geocode_villages(tuple(cov_df[village_col].unique()))
-                cov_df['coords'] = cov_df[village_col].map(coords)
-                cov_df = cov_df.dropna(subset=['coords'])
-                if not cov_df.empty:
+                valid_coords = {k: v for k, v in coords.items() if v is not None}
+                
+                if valid_coords:
                     m = folium.Map(location=[9.0, 8.5], zoom_start=7, tiles="CartoDB positron")
                     folium.LayerControl(collapsed=False).add_to(m)
                     if show_lga and lga_geojson:
                         try: folium.GeoJson(lga_geojson, name="LGA Boundaries", style_function=lambda x: {'fillColor': 'transparent', 'color': '#2c3e50', 'weight': 1.5, 'opacity': 0.8}, tooltip=folium.GeoJsonTooltip(fields=["name"], aliases=["LGA:"])).add_to(m)
                         except: pass
-                    for _, row in cov_df.iterrows():
-                        lat, lon = row['coords']; pct = row['coverage_pct']; unvax = int(row['count'] - row['sum'])
+                    
+                    for v, (lat, lon) in valid_coords.items():
+                        row = cov_df[cov_df[village_col] == v].iloc[0]
+                        pct = row['coverage_pct']; unvax = int(row['count'] - row['sum'])
                         color = "#e74c3c" if pct < 50 else "#f39c12" if pct < 80 else "#27ae60"
                         radius = 6 + (pct / 15)
-                        popup_html = f"""<div style="font-family:sans-serif; min-width:150px;"><b>{row[village_col]}</b><br><span style="color:{color};">● Coverage: {pct}%</span><br>Unvaccinated: {unvax} | Total: {int(row['count'])}</div>"""
-                        folium.CircleMarker(location=[lat, lon], radius=radius, color=color, weight=2, fill=True, fill_color=color, fill_opacity=0.75, popup=folium.Popup(popup_html, max_width=250), tooltip=f"{row[village_col]}: {pct}%").add_to(m)
-                    sw, ne = cov_df['coords'].apply(lambda x: x[0]).min() - 0.1, cov_df['coords'].apply(lambda x: x[1]).max() + 0.1
-                    m.fit_bounds([[sw - 0.2, ne - 0.2], [sw + 0.2, ne + 0.2]])
+                        popup_html = f"""<div style="font-family:sans-serif; min-width:150px;"><b>{v}</b><br><span style="color:{color};">● Coverage: {pct}%</span><br>Unvaccinated: {unvax} | Total: {int(row['count'])}</div>"""
+                        folium.CircleMarker(location=[lat, lon], radius=radius, color=color, weight=2, fill=True, fill_color=color, fill_opacity=0.75, popup=folium.Popup(popup_html, max_width=250), tooltip=f"{v}: {pct}%").add_to(m)
+                    
+                    if valid_coords:
+                        lats, lons = zip(*valid_coords.values())
+                        m.fit_bounds([[min(lats)-0.1, min(lons)-0.1], [max(lats)+0.1, max(lons)+0.1]])
                     st_folium(m, width=700, height=500, returned_objects=[])
-                    cov_export = cov_df.copy()
+                    
+                    cov_export = pd.DataFrame(list(valid_coords.items()), columns=['Village', 'coords'])
                     cov_export['Lat'], cov_export['Lon'] = cov_export['coords'].apply(lambda x: x[0]), cov_export['coords'].apply(lambda x: x[1])
-                    csv = cov_export[['Village / Settlement', 'Lat', 'Lon', 'coverage_pct']].to_csv(index=False).encode("utf-8")
+                    csv = cov_export[['Village', 'Lat', 'Lon']].to_csv(index=False).encode("utf-8")
                     st.download_button("⬇️ Download Geocoded Coordinates", csv, "village_coordinates.csv", "text/csv")
-                else: st.warning("⚠️ Geocoding failed for all villages.")
+                else:
+                    st.error("❌ Geocoding failed for all villages. OpenStreetMap may not know these specific village names. Try using a CSV with Lat/Lon columns if available.")
             else: st.info("ℹ️ Insufficient data for mapping (min 3 records per village).")
         else: st.info("ℹ️ Select a vaccine and ensure village data is available.")
 
