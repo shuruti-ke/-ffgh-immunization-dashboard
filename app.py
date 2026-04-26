@@ -164,20 +164,10 @@ def solve_tsp_route(coords_dict, start_village=None):
 
 # ================= DEDUPLICATION LOGIC =================
 def apply_deduplication(df, mode, date_col="date"):
-    """
-    Removes repeats based on selected view mode.
-    ⚠️ ASSUMPTION: Child Name + Caregiver Phone + Village uniquely identifies a child.
-    If names are spelled differently across visits, they may be counted as separate children.
-    """
     original_count = len(df)
     if mode == "1. All Visits (Raw)":
-        return df, {
-            "mode": mode,
-            "original": original_count,
-            "final": original_count,
-            "removed": 0,
-            "description": "Shows every submission exactly as recorded. Best for tracking CHEW workload and total services delivered. May double-count children who visited multiple times."
-        }
+        return df, {"mode": mode, "original": original_count, "final": original_count, "removed": 0, 
+                    "description": "Shows every submission exactly as recorded. Best for tracking CHEW workload and total services delivered. May double-count children who visited multiple times."}
     elif mode == "2. Unique Children Only":
         if "uuid" in df.columns or "_uuid" in df.columns:
             uuid_col = "uuid" if "uuid" in df.columns else "_uuid"
@@ -186,24 +176,14 @@ def apply_deduplication(df, mode, date_col="date"):
             key_cols = [c for c in ["Child's Name", "Caregiver Phone", "Village / Settlement"] if c in df.columns]
             if not key_cols: return df, {"mode": mode, "original": original_count, "final": original_count, "removed": 0, "description": "No child identifier columns found."}
             df_dedup = df.sort_values(date_col, ascending=False, na_position='last').drop_duplicates(subset=key_cols, keep="first")
-        return df_dedup, {
-            "mode": mode,
-            "original": original_count,
-            "final": len(df_dedup),
-            "removed": original_count - len(df_dedup),
-            "description": "Keeps only the latest record per child. Best for accurate population coverage rates. Removes repeat visits by the same child."
-        }
+        return df_dedup, {"mode": mode, "original": original_count, "final": len(df_dedup), "removed": original_count - len(df_dedup), 
+                          "description": "Keeps only the latest record per child. Best for accurate population coverage rates. Removes repeat visits by the same child."}
     elif mode == "3. Unique Households Only":
         key_cols = [c for c in ["Caregiver Phone", "Village / Settlement"] if c in df.columns]
         if not key_cols: return df, {"mode": mode, "original": original_count, "final": original_count, "removed": 0, "description": "No household identifier columns found."}
         df_dedup = df.sort_values(date_col, ascending=False, na_position='last').drop_duplicates(subset=key_cols, keep="first")
-        return df_dedup, {
-            "mode": mode,
-            "original": original_count,
-            "final": len(df_dedup),
-            "removed": original_count - len(df_dedup),
-            "description": "Keeps only the latest record per household (caregiver + village). Best for tracking household reach and resource distribution. Ignores how many children per household were visited."
-        }
+        return df_dedup, {"mode": mode, "original": original_count, "final": len(df_dedup), "removed": original_count - len(df_dedup), 
+                          "description": "Keeps only the latest record per household (caregiver + village). Best for tracking household reach and resource distribution."}
     return df, {"mode": mode, "original": original_count, "final": original_count, "removed": 0, "description": ""}
 
 # ================= DATA PROCESSING =================
@@ -261,16 +241,25 @@ def main():
         st.info("👆 Please upload your CHEW log file to activate the dashboard.")
         return
 
+    # ===== LGA BOUNDARIES UPLOAD (FIXED ZIP/JSON SECTION) =====
     st.sidebar.subheader("🗺️ LGA Boundaries (Optional)")
     upload_method = st.sidebar.radio("Upload method:", ["Single GeoJSON", "Multiple files / ZIP archive"], index=0)
     lga_geojson = None
+    
     if upload_method == "Single GeoJSON":
         lga_file = st.sidebar.file_uploader("📂 Upload LGA GeoJSON", type=["geojson", "json"])
         if lga_file:
-            try: lga_geojson = json.load(lga_file); st.sidebar.success(f"✅ Loaded: {lga_file.name}")
-            except Exception as e: st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
+            try:
+                lga_geojson = json.load(lga_file)
+                st.sidebar.success(f"✅ Loaded: {lga_file.name}")
+            except Exception as e:
+                st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
     else:
-        uploaded_files = st.sidebar.file_uploader("📂 Upload GeoJSONs or ZIP", type=["geojson", "json", "zip"], accept_multiple_files=True)
+        uploaded_files = st.sidebar.file_uploader(
+            "📂 Upload GeoJSONs or ZIP", 
+            type=["geojson", "json", "zip"], 
+            accept_multiple_files=True
+        )
         if uploaded_files:
             lga_geojson = {"type": "FeatureCollection", "features": []}
             files_loaded = 0
@@ -280,19 +269,28 @@ def main():
                         with zipfile.ZipFile(f, 'r') as zip_ref:
                             for zf in zip_ref.namelist():
                                 if zf.endswith(('.geojson', '.json')):
-                                    with zip_ref.open(zf) as zf_
+                                    with zip_ref.open(zf) as zf_data:
                                         data = json.load(zf_data)
-                                        if "features" in data: lga_geojson["features"].extend(data["features"]); files_loaded += 1
+                                        if "features" in data:
+                                            lga_geojson["features"].extend(data["features"])
+                                            files_loaded += 1
                     else:
                         data = json.load(f)
-                        if "features" in data: lga_geojson["features"].extend(data["features"]); files_loaded += 1
-                except Exception as e: st.sidebar.warning(f"⚠️ Could not load {f.name}: {str(e)[:50]}")
-            if files_loaded > 0: st.sidebar.success(f"✅ Loaded {files_loaded} file(s)")
-            else: lga_geojson = None; st.sidebar.error("❌ No valid GeoJSON files found")
+                        if "features" in data:
+                            lga_geojson["features"].extend(data["features"])
+                            files_loaded += 1
+                except Exception as e:
+                    st.sidebar.warning(f"⚠️ Could not load {f.name}: {str(e)[:50]}")
+                    
+            if files_loaded > 0:
+                st.sidebar.success(f"✅ Loaded {files_loaded} file(s)")
+            else:
+                lga_geojson = None
+                st.sidebar.error("❌ No valid GeoJSON files found")
 
     if lga_geojson is None:
         lga_geojson = fetch_nigeria_lga_geojson()
-        if lga_geojson: st.sidebar.info("🌐 Auto-loaded LGA boundaries")
+        if lga_geojson: st.sidebar.info("🌐 Auto-loaded LGA boundaries from open data source")
         else: st.sidebar.warning("💡 Auto-load failed. Upload manually for LGA features.")
 
     sheet_name = None
@@ -314,7 +312,7 @@ def main():
     selected_village = st.sidebar.selectbox("🏘️ Village / Settlement", ["All"] + villages)
     if chew_col:
         chews = sorted(df[chew_col].dropna().unique().tolist())
-        selected_chew = st.sidebar.selectbox("👩‍⚕️ CHEW", ["All"] + chews)
+        selected_chew = st.sidebar.selectbox("👩‍️ CHEW", ["All"] + chews)
     else: selected_chew = "All"
 
     st.sidebar.subheader("📅 Date Range")
@@ -374,7 +372,6 @@ def main():
     df_f, mode_info = apply_deduplication(df_filtered, view_mode, date_col)
     total = len(df_f)
 
-    # Show mode banner
     st.info(f"**{mode_info['mode']}** — {mode_info['description']}")
     if mode_info['removed'] > 0:
         st.success(f"✅ Removed {mode_info['removed']} repeat records. Showing {mode_info['final']} unique records out of {mode_info['original']} total submissions.")
@@ -407,7 +404,7 @@ def main():
         """)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("📋 Total Records", f"{total:,}")
-        if chew_col: c4.metric("👩‍️ Active CHEWs", df_f[chew_col].nunique() if chew_col in df_f.columns else 0)
+        if chew_col: c4.metric("👩‍⚕️ Active CHEWs", df_f[chew_col].nunique() if chew_col in df_f.columns else 0)
         bcg_col = "Vax_BCG" if "Vax_BCG" in df_f.columns else None
         opv0_col = next((c for c in df_f.columns if "OPV 0" in c), None)
         if bcg_col and opv0_col and total > 0:
@@ -498,7 +495,7 @@ def main():
         else: st.info("ℹ️ Select a vaccine to identify priority areas.")
 
     with tab2:
-        st.subheader("👩‍⚕️ CHEW Performance & Coverage Distribution")
+        st.subheader("👩‍️ CHEW Performance & Coverage Distribution")
         st.markdown("""
         **What this shows:** How each CHEW is performing and how vaccines are distributed across your team.
         - **Visits/Children Reached**: Depends on your Data View Mode toggle.
@@ -517,7 +514,6 @@ def main():
             chew_perf["Coverage %"] = (chew_perf["Vaccinated"] / chew_perf["Total"] * 100).round(1)
             chew_perf["Unvaccinated"] = chew_perf["Total"] - chew_perf["Vaccinated"]
             
-            # Calculate repeat rate per CHEW
             if mode_info['removed'] > 0:
                 orig_df = df_filtered[[chew_col]].copy()
                 orig_counts = orig_df[chew_col].value_counts()
