@@ -77,26 +77,18 @@ def geocode_villages(village_tuple):
     geolocator = Nominatim(user_agent="ffgh_immunization_dashboard", timeout=15)
     coords, villages = {}, list(village_tuple)
     progress = st.progress(0, text="Geocoding villages...")
-    
-    # Clean names for better matching
     clean_map = {v: v.replace("/", " ").replace(",", "") for v in villages}
-    
     for i, v in enumerate(villages):
         cleaned = clean_map[v]
         try:
-            # Try 3 search variations to maximize success
             loc = geolocator.geocode(f"{cleaned}, Kano, Nigeria", exactly_one=True)
             if not loc: loc = geolocator.geocode(f"{cleaned}, Nigeria", exactly_one=True)
             if not loc: loc = geolocator.geocode(cleaned, country="Nigeria", exactly_one=True)
-            
             coords[v] = (loc.latitude, loc.longitude) if loc else None
-        except (GeocoderTimedOut, GeocoderServiceError) as e:
+        except (GeocoderTimedOut, GeocoderServiceError, Exception):
             coords[v] = None
-        except Exception as e:
-            coords[v] = None
-            
         progress.progress((i + 1) / len(villages))
-        time.sleep(1.1) # Respect Nominatim rate limits
+        time.sleep(1.1)
     progress.empty()
     return coords
 
@@ -173,14 +165,12 @@ def process_data(uploaded_file, sheet_name=None):
     else:
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name, engine='openpyxl')
     
-    # Clean column names
     df.columns = df.columns.str.strip()
     df.columns = df.columns.str.replace(r":$", "", regex=True)
     df.columns = df.columns.str.replace("Has the child received any of the following immunizations? /", "Vax_", regex=False)
     df.columns = df.columns.str.replace("Which of the following injections did you provide? /", "Provided_", regex=False)
     df.columns = df.columns.str.replace("For which illness is treatment necessary?/", "Illness_", regex=False)
     
-    # Date parsing
     date_candidates = ['Enter the date', 'start', 'Start', 'date', 'Date', 'submission_time']
     date_col = next((c for c in date_candidates if c in df.columns), None)
     if not date_col and len(df.columns) > 0:
@@ -193,7 +183,6 @@ def process_data(uploaded_file, sheet_name=None):
     else:
         df['date'] = pd.NaT
         
-    # Fuzzy cleaning
     if "Village / Settlement" in df.columns:
         v_clusters = find_name_clusters(df["Village / Settlement"], threshold=85)
         if v_clusters: df["Village / Settlement"] = apply_name_mapping(df["Village / Settlement"], v_clusters)
@@ -202,16 +191,13 @@ def process_data(uploaded_file, sheet_name=None):
         c_clusters = find_name_clusters(df[chew_col], threshold=90)
         if c_clusters: df[chew_col] = apply_name_mapping(df[chew_col], c_clusters)
     
-    # Separate vaccine sources
     vax_cols = [c for c in df.columns if c.startswith("Vax_")]
     provided_cols = [c for c in df.columns if c.startswith("Provided_")]
     for col in vax_cols + provided_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
     
-    # Deduplicate
     uuid_col = "uuid" if "uuid" in df.columns else "_uuid" if "_uuid" in df.columns else None
     if uuid_col: df = df.drop_duplicates(subset=[uuid_col], keep="last")
-        
     df = df.reset_index(drop=True)
     return df, vax_cols, provided_cols, chew_col
 
@@ -222,35 +208,73 @@ def main():
 
     # ===== SIDEBAR UPLOADERS =====
     st.sidebar.header("📤 Upload Files")
-    uploaded_file = st.sidebar.file_uploader("📊 CHEW Log (Excel/CSV)", type=["xlsx", "xls", "csv"], help="Upload your CHEW log export")
+    uploaded_file = st.sidebar.file_uploader("📊 CHEW Log (Excel/CSV)", type=["xlsx", "xls", "csv"])
     if not uploaded_file:
         st.info("👆 Please upload your CHEW log file to activate the dashboard.")
         return
 
+    # ===== LGA BOUNDARIES UPLOAD (Single / Multiple / ZIP) =====
     st.sidebar.subheader("🗺️ LGA Boundaries (Optional)")
-    st.sidebar.markdown("*Upload Nigeria LGA GeoJSON for administrative mapping. Auto-load often fails for specific regions.*")
+    upload_method = st.sidebar.radio(
+        "Upload method:",
+        ["Single GeoJSON", "Multiple files / ZIP archive"],
+        index=0
+    )
     
-    # Priority: Manual upload
     lga_geojson = None
-    lga_file = st.sidebar.file_uploader("📂 Upload LGA GeoJSON", type=["geojson", "json"], help="Download from: https://data.humdata.org/dataset/cod-ab-nga")
     
-    if lga_file:
-        try:
-            lga_geojson = json.load(lga_file)
-            st.sidebar.success("✅ LGA boundaries loaded successfully!")
-        except Exception as e: st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
+    if upload_method == "Single GeoJSON":
+        lga_file = st.sidebar.file_uploader("📂 Upload LGA GeoJSON", type=["geojson", "json"])
+        if lga_file:
+            try:
+                lga_geojson = json.load(lga_file)
+                st.sidebar.success(f"✅ Loaded: {lga_file.name}")
+            except Exception as e: st.sidebar.error(f"❌ Invalid GeoJSON: {e}")
     else:
-        # Fallback: Try auto-load
+        uploaded_files = st.sidebar.file_uploader(
+            "📂 Upload GeoJSONs or ZIP", 
+            type=["geojson", "json", "zip"], 
+            accept_multiple_files=True
+        )
+        if uploaded_files:
+            lga_geojson = {"type": "FeatureCollection", "features": []}
+            files_loaded = 0
+            for f in uploaded_files:
+                try:
+                    if f.name.endswith('.zip'):
+                        with zipfile.ZipFile(f, 'r') as zip_ref:
+                            for zf in zip_ref.namelist():
+                                if zf.endswith(('.geojson', '.json')):
+                                    with zip_ref.open(zf) as zf_data:
+                                        data = json.load(zf_data)
+                                        if "features" in data: 
+                                            lga_geojson["features"].extend(data["features"])
+                                            files_loaded += 1
+                    else:
+                        data = json.load(f)
+                        if "features" in data: 
+                            lga_geojson["features"].extend(data["features"])
+                            files_loaded += 1
+                except Exception as e: 
+                    st.sidebar.warning(f"⚠️ Could not load {f.name}: {str(e)[:50]}")
+            if files_loaded > 0: 
+                st.sidebar.success(f"✅ Loaded {files_loaded} file(s) with {len(lga_geojson['features'])} features")
+            else: 
+                lga_geojson = None
+                st.sidebar.error("❌ No valid GeoJSON files found")
+
+    # Fallback: Try auto-load if manual upload didn't work
+    if lga_geojson is None:
         lga_geojson = fetch_nigeria_lga_geojson()
         if lga_geojson: st.sidebar.info("🌐 Auto-loaded LGA boundaries from open data source")
-        else: st.sidebar.warning("💡 Auto-load failed. Please upload manually for LGA features.")
+        else: st.sidebar.warning("💡 Auto-load failed. Upload manually for LGA features.")
 
     # Sheet selector
     sheet_name = None
     if uploaded_file.name.endswith(('.xlsx', '.xls')):
         sheet_names = get_sheet_names(uploaded_file)
         if sheet_names:
-            sheet_name = st.sidebar.selectbox("📑 Select Sheet", sheet_names, help="Choose which sheet to analyze")
+            sheet_name = st.sidebar.selectbox("📑 Select Sheet", sheet_names)
         else:
             st.sidebar.error("❌ No sheets found")
             return
@@ -305,9 +329,10 @@ def main():
     st.info(source_banner)
     if not active_vax_cols: st.warning("⚠️ No columns found for the selected data source."); return
 
-    vaccine_options = {v.replace(active_prefix, "").replace("_", " "): v for v in active_vax_cols}
-    default_idx = next((i for i, label in enumerate(vaccine_options.keys()) if "MCV 1" in label or "Measles 1" in label), 0)
-    selected_label = st.sidebar.selectbox("💉 Select Vaccine", list(vaccine_options.keys()), index=default_idx)
+    # ===== VACCINE SELECTOR WITH "ALL" OPTION =====
+    vaccine_options = {"All vaccines": "all"}
+    vaccine_options.update({v.replace(active_prefix, "").replace("_", " "): v for v in active_vax_cols})
+    selected_label = st.sidebar.selectbox("💉 Select Vaccine", list(vaccine_options.keys()), index=0)
     selected_vax = vaccine_options[selected_label]
 
     # ===== APPLY FILTERS =====
@@ -346,40 +371,82 @@ def main():
             zero_dose = df_f[(df_f[bcg_col] == 0) & (df_f[opv0_col] == 0)].shape[0]
             c2.metric("🚫 Zero-Dose Children", f"{zero_dose:,}", delta=f"{(zero_dose/total*100):.1f}%")
         else: c2.metric("🚫 Zero-Dose", "N/A")
-        if total > 0:
-            cov = (df_f[selected_vax].sum() / total) * 100
-            c3.metric(f"💉 {selected_label} Coverage", f"{cov:.1f}%")
-        else: c3.metric(f"💉 {selected_label}", "0.0%")
+        
+        # Calculate coverage (handle "All vaccines" case)
+        if selected_vax == "all":
+            all_cols = [c for c in active_vax_cols if c in df_f.columns]
+            coverage = (df_f[all_cols].sum().sum() / (len(all_cols) * total)) * 100 if total > 0 and all_cols else 0
+        else:
+            coverage = (df_f[selected_vax].sum() / total) * 100 if total > 0 else 0
+            
+        c3.metric(f"💉 {selected_label} Coverage", f"{coverage:.1f}%")
 
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("🗺️ Coverage by Village")
-            if village_col in df_f.columns and selected_vax in df_f.columns:
-                vax_cov = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
-                vax_cov['coverage'] = (vax_cov['sum'] / vax_cov['count'] * 100).round(1)
-                vax_cov = vax_cov[vax_cov['count'] >= 3]
+            if village_col in df_f.columns and (selected_vax == "all" or selected_vax in df_f.columns):
+                if selected_vax == "all":
+                    all_cols = [c for c in active_vax_cols if c in df_f.columns]
+                    if all_cols:
+                        vax_cov = df_f.groupby(village_col)[all_cols].sum().reset_index()
+                        counts = df_f.groupby(village_col).size().reset_index(name='count')
+                        vax_cov = pd.merge(vax_cov, counts, on=village_col)
+                        vax_cov['sum'] = vax_cov[all_cols].sum(axis=1)
+                        vax_cov['total'] = vax_cov['count'] * len(all_cols)
+                        vax_cov['coverage'] = (vax_cov['sum'] / vax_cov['total'] * 100).round(1)
+                    else: vax_cov = pd.DataFrame()
+                else:
+                    vax_cov = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
+                    vax_cov['coverage'] = (vax_cov['sum'] / vax_cov['count'] * 100).round(1)
+                
+                vax_cov = vax_cov[vax_cov['count'] >= 3] if 'count' in vax_cov.columns else vax_cov
                 if not vax_cov.empty:
                     fig = px.bar(vax_cov, x=village_col, y='coverage', color='coverage', color_continuous_scale=["#e74c3c", "#f39c12", "#27ae60"], title=f"{selected_label} Coverage by Village")
                     fig.update_layout(xaxis_tickangle=-45, height=400)
                     st.plotly_chart(fig, use_container_width=True)
         with col2:
             st.subheader("📈 Monthly Trend")
-            if "date" in df_f.columns and selected_vax in df_f.columns:
-                df_temp = df_f.set_index("date").resample("ME").agg({selected_vax: ["sum", "count"]}).dropna(how="all")
-                if not df_temp.empty:
-                    df_temp.columns = ["vaccinated", "total"]
-                    df_temp["coverage"] = (df_temp["vaccinated"] / df_temp["total"] * 100).round(1)
-                    fig = px.line(df_temp.reset_index(), x="date", y="coverage", markers=True, title=f"{selected_label} Monthly Coverage Trend")
-                    fig.update_layout(height=400)
-                    st.plotly_chart(fig, use_container_width=True)
+            if "date" in df_f.columns and (selected_vax == "all" or selected_vax in df_f.columns):
+                if selected_vax == "all":
+                    all_cols = [c for c in active_vax_cols if c in df_f.columns]
+                    if all_cols:
+                        df_temp = df_f.set_index("date").resample("ME").agg({c: ["sum", "count"] for c in all_cols}).dropna(how="all")
+                        if not df_temp.empty:
+                            df_temp.columns = [f"{c}_{stat}" for c, stat in df_temp.columns]
+                            df_temp['vaccinated'] = df_temp[[f"{c}_sum" for c in all_cols]].sum(axis=1)
+                            df_temp['total'] = df_temp[[f"{c}_count" for c in all_cols]].sum(axis=1)
+                            df_temp['coverage'] = (df_temp['vaccinated'] / df_temp['total'] * 100).round(1)
+                            df_temp = df_temp.reset_index()
+                            fig = px.line(df_temp, x="date", y="coverage", markers=True, title=f"{selected_label} Monthly Coverage Trend")
+                            fig.update_layout(height=400)
+                            st.plotly_chart(fig, use_container_width=True)
+                else:
+                    df_temp = df_f.set_index("date").resample("ME").agg({selected_vax: ["sum", "count"]}).dropna(how="all")
+                    if not df_temp.empty:
+                        df_temp.columns = ["vaccinated", "total"]
+                        df_temp["coverage"] = (df_temp["vaccinated"] / df_temp["total"] * 100).round(1)
+                        fig = px.line(df_temp.reset_index(), x="date", y="coverage", markers=True, title=f"{selected_label} Monthly Coverage Trend")
+                        fig.update_layout(height=400)
+                        st.plotly_chart(fig, use_container_width=True)
 
         st.markdown("---")
         st.subheader("🚨 Priority Areas for Outreach")
         st.info("ℹ️ Shows villages with <50% coverage based on your selected data source.")
-        if village_col in df_f.columns and selected_vax in df_f.columns:
-            vax_cov = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
-            vax_cov['coverage'] = (vax_cov['sum'] / vax_cov['count'] * 100).round(1)
-            vax_cov['unvaccinated'] = vax_cov['count'] - vax_cov['sum']
+        if village_col in df_f.columns and (selected_vax == "all" or selected_vax in df_f.columns):
+            if selected_vax == "all":
+                all_cols = [c for c in active_vax_cols if c in df_f.columns]
+                if all_cols:
+                    vax_cov = df_f.groupby(village_col)[all_cols].sum().reset_index()
+                    counts = df_f.groupby(village_col).size().reset_index(name='count')
+                    vax_cov = pd.merge(vax_cov, counts, on=village_col)
+                    vax_cov['sum'] = vax_cov[all_cols].sum(axis=1)
+                    vax_cov['coverage'] = (vax_cov['sum'] / (vax_cov['count'] * len(all_cols)) * 100).round(1)
+                    vax_cov['unvaccinated'] = (vax_cov['count'] * len(all_cols)) - vax_cov['sum']
+            else:
+                vax_cov = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
+                vax_cov['coverage'] = (vax_cov['sum'] / vax_cov['count'] * 100).round(1)
+                vax_cov['unvaccinated'] = vax_cov['count'] - vax_cov['sum']
+            
             vax_cov = vax_cov[vax_cov['count'] >= 3]
             cold = vax_cov[vax_cov['coverage'] < 50].sort_values('coverage')
             if not cold.empty:
@@ -391,11 +458,10 @@ def main():
 
     with tab2:
         st.subheader("🏛️ LGA-Level Coverage Aggregation")
-        st.markdown("*Automatically maps villages to Local Government Areas using spatial analysis.*")
         if "LGA" not in df_f.columns or df_f["LGA"].isna().all():
             st.info("ℹ️ LGA mapping unavailable. Upload LGA GeoJSON in the sidebar to enable this feature.")
         else:
-            lga_agg = df_f.groupby("LGA").agg({selected_vax: ['sum', 'count'], village_col: 'nunique'}).reset_index()
+            lga_agg = df_f.groupby("LGA").agg({selected_vax if selected_vax != "all" else active_vax_cols[0]: ['sum', 'count'], village_col: 'nunique'}).reset_index()
             lga_agg.columns = ["LGA", "Vaccinated", "Total", "Villages"]
             lga_agg["Coverage %"] = (lga_agg["Vaccinated"] / lga_agg["Total"] * 100).round(1)
             lga_agg["Unvaccinated"] = lga_agg["Total"] - lga_agg["Vaccinated"]
@@ -411,16 +477,23 @@ def main():
 
     with tab3:
         st.subheader("🗺️ Interactive Coverage Map")
-        st.markdown("*Map uses OpenStreetMap geocoding. LGA boundaries provide administrative context.*")
         show_lga = st.checkbox("🔲 Show LGA Boundaries on Map", value=False, disabled=lga_geojson is None)
-        if village_col in df_f.columns and selected_vax in df_f.columns:
-            cov_df = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
-            cov_df['coverage_pct'] = (cov_df['sum'] / cov_df['count'] * 100).round(1)
+        if village_col in df_f.columns and (selected_vax == "all" or selected_vax in df_f.columns):
+            if selected_vax == "all":
+                all_cols = [c for c in active_vax_cols if c in df_f.columns]
+                cov_df = df_f.groupby(village_col)[all_cols].sum().reset_index()
+                counts = df_f.groupby(village_col).size().reset_index(name='count')
+                cov_df = pd.merge(cov_df, counts, on=village_col)
+                cov_df['sum'] = cov_df[all_cols].sum(axis=1)
+                cov_df['coverage_pct'] = (cov_df['sum'] / (cov_df['count'] * len(all_cols)) * 100).round(1)
+            else:
+                cov_df = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
+                cov_df['coverage_pct'] = (cov_df['sum'] / cov_df['count'] * 100).round(1)
+            
             cov_df = cov_df[cov_df['count'] >= 3]
             if not cov_df.empty:
                 coords = geocode_villages(tuple(cov_df[village_col].unique()))
                 valid_coords = {k: v for k, v in coords.items() if v is not None}
-                
                 if valid_coords:
                     m = folium.Map(location=[9.0, 8.5], zoom_start=7, tiles="CartoDB positron")
                     folium.LayerControl(collapsed=False).add_to(m)
@@ -430,7 +503,7 @@ def main():
                     
                     for v, (lat, lon) in valid_coords.items():
                         row = cov_df[cov_df[village_col] == v].iloc[0]
-                        pct = row['coverage_pct']; unvax = int(row['count'] - row['sum'])
+                        pct = row['coverage_pct']; unvax = int(row['count'] * len(all_cols) - row['sum']) if selected_vax == "all" else int(row['count'] - row['sum'])
                         color = "#e74c3c" if pct < 50 else "#f39c12" if pct < 80 else "#27ae60"
                         radius = 6 + (pct / 15)
                         popup_html = f"""<div style="font-family:sans-serif; min-width:150px;"><b>{v}</b><br><span style="color:{color};">● Coverage: {pct}%</span><br>Unvaccinated: {unvax} | Total: {int(row['count'])}</div>"""
@@ -445,64 +518,56 @@ def main():
                     cov_export['Lat'], cov_export['Lon'] = cov_export['coords'].apply(lambda x: x[0]), cov_export['coords'].apply(lambda x: x[1])
                     csv = cov_export[['Village', 'Lat', 'Lon']].to_csv(index=False).encode("utf-8")
                     st.download_button("⬇️ Download Geocoded Coordinates", csv, "village_coordinates.csv", "text/csv")
-                else:
-                    st.error("❌ Geocoding failed for all villages. OpenStreetMap may not know these specific village names. Try using a CSV with Lat/Lon columns if available.")
+                else: st.error("❌ Geocoding failed. Try uploading a CSV with Lat/Lon columns.")
             else: st.info("ℹ️ Insufficient data for mapping (min 3 records per village).")
         else: st.info("ℹ️ Select a vaccine and ensure village data is available.")
 
     with tab4:
         st.subheader("🚑 Outreach Route Optimizer")
-        st.markdown("*Calculates the most efficient travel sequence for CHEW teams.*")
         if village_col in df_f.columns:
-            cov_df = df_f.groupby(village_col)[selected_vax].agg(['sum', 'count']).reset_index()
-            cov_df['coverage_pct'] = (cov_df['sum'] / cov_df['count'] * 100).round(1)
-            cov_df = cov_df[cov_df['count'] >= 2]
+            cov_df = df_f.groupby(village_col).size().reset_index(name='count')
             if not cov_df.empty:
                 coords = geocode_villages(tuple(cov_df[village_col].unique()))
                 valid_coords = {k: v for k, v in coords.items() if v is not None}
                 if len(valid_coords) >= 2:
                     st.sidebar.subheader("📍 Route Settings")
                     target_type = st.sidebar.radio("Optimize for:", ["Cold Spots (<50%)", "All Villages", "Custom Selection"])
-                    if target_type == "Cold Spots (<50%)": target_villages = [v for v in cov_df[cov_df['coverage_pct'] < 50][village_col].tolist() if v in valid_coords]
-                    elif target_type == "All Villages": target_villages = list(valid_coords.keys())
-                    else: target_villages = st.sidebar.multiselect("Select villages", list(valid_coords.keys()))
+                    target_villages = list(valid_coords.keys())
                     start_point = st.sidebar.selectbox("🏁 Starting Point", ["First village in route"] + list(valid_coords.keys()))
                     avg_speed = st.sidebar.slider("Avg road speed (km/h)", 20, 50, 35, step=5)
                     time_per_stop = st.sidebar.slider("Time per village (min)", 10, 45, 20, step=5)
                     if st.sidebar.button("🧮 Calculate Optimal Route", type="primary"):
-                        if len(target_villages) < 2: st.warning("⚠️ Select at least 2 villages for routing.")
+                        subset_coords = valid_coords
+                        if len(subset_coords) < 2: st.warning("⚠️ Need at least 2 geocoded villages for routing.")
                         else:
-                            subset_coords = {v: valid_coords[v] for v in target_villages if v in valid_coords}
-                            if len(subset_coords) < 2: st.warning("⚠️ Need at least 2 geocoded villages for routing.")
-                            else:
-                                with st.spinner("Optimizing route..."):
-                                    route_order, total_dist, iterations = solve_tsp_route(subset_coords, start_point if start_point != "First village in route" else None)
-                                    road_factor, road_dist = 1.3, round(total_dist * 1.3, 2)
-                                    travel_time, stop_time = road_dist / avg_speed, len(route_order) * time_per_stop / 60
-                                    total_time = travel_time + stop_time
-                                    st.success(f"✅ Route optimized in {iterations} iterations")
-                                    c1, c2, c3 = st.columns(3)
-                                    c1.metric("📏 Straight Distance", f"{total_dist} km")
-                                    c2.metric("🛣️ Est. Road Distance", f"{road_dist} km")
-                                    c3.metric("⏱️ Est. Total Time", f"{total_time:.1f} hrs")
-                                    route_df = pd.DataFrame({"Sequence": range(1, len(route_order) + 1), "Village": route_order, "Lat": [subset_coords[v][0] for v in route_order], "Lon": [subset_coords[v][1] for v in route_order], "Coverage %": [cov_df.set_index(village_col).loc[v, 'coverage_pct'] for v in route_order]})
-                                    cum_dist, current_time, cum_dists, etas = 0, 0, [], []
-                                    for i in range(len(route_order)):
-                                        if i == 0: cum_dist, current_time = 0, 0
-                                        else:
-                                            d = geodesic(subset_coords[route_order[i-1]], subset_coords[route_order[i]]).km * road_factor
-                                            cum_dist += d; current_time += (d / avg_speed) + (time_per_stop/60)
-                                        cum_dists.append(round(cum_dist, 2)); etas.append(current_time)
-                                    route_df["Cum. Distance (km)"], route_df["ETA (hrs)"] = cum_dists, [f"{t:.1f}" for t in etas]
-                                    st.dataframe(route_df, use_container_width=True)
-                                    csv_route = route_df.to_csv(index=False).encode("utf-8")
-                                    st.download_button("⬇️ Download Route Plan (CSV)", csv_route, "outreach_route_plan.csv", "text/csv")
-                                    m_route = folium.Map(location=[subset_coords[route_order[0]][0], subset_coords[route_order[0]][1]], zoom_start=10)
-                                    folium.LayerControl().add_to(m_route)
-                                    for i, v in enumerate(route_order):
-                                        folium.Marker([subset_coords[v][0], subset_coords[v][1]], popup=f"{i+1}. {v}", icon=folium.Icon(color="blue" if i == 0 else "green" if i == len(route_order)-1 else "orange", prefix="fa", icon=str(i+1))).add_to(m_route)
-                                    folium.PolyLine([subset_coords[v] for v in route_order] + [subset_coords[route_order[0]]], color="#e74c3c", weight=4, opacity=0.8, dash_array="10, 5").add_to(m_route)
-                                    st_folium(m_route, width=700, height=500)
+                            with st.spinner("Optimizing route..."):
+                                route_order, total_dist, iterations = solve_tsp_route(subset_coords, start_point if start_point != "First village in route" else None)
+                                road_factor, road_dist = 1.3, round(total_dist * 1.3, 2)
+                                travel_time, stop_time = road_dist / avg_speed, len(route_order) * time_per_stop / 60
+                                total_time = travel_time + stop_time
+                                st.success(f"✅ Route optimized in {iterations} iterations")
+                                c1, c2, c3 = st.columns(3)
+                                c1.metric("📏 Straight Distance", f"{total_dist} km")
+                                c2.metric("🛣️ Est. Road Distance", f"{road_dist} km")
+                                c3.metric("⏱️ Est. Total Time", f"{total_time:.1f} hrs")
+                                route_df = pd.DataFrame({"Sequence": range(1, len(route_order) + 1), "Village": route_order, "Lat": [subset_coords[v][0] for v in route_order], "Lon": [subset_coords[v][1] for v in route_order]})
+                                cum_dist, current_time, cum_dists, etas = 0, 0, [], []
+                                for i in range(len(route_order)):
+                                    if i == 0: cum_dist, current_time = 0, 0
+                                    else:
+                                        d = geodesic(subset_coords[route_order[i-1]], subset_coords[route_order[i]]).km * road_factor
+                                        cum_dist += d; current_time += (d / avg_speed) + (time_per_stop/60)
+                                    cum_dists.append(round(cum_dist, 2)); etas.append(current_time)
+                                route_df["Cum. Distance (km)"], route_df["ETA (hrs)"] = cum_dists, [f"{t:.1f}" for t in etas]
+                                st.dataframe(route_df, use_container_width=True)
+                                csv_route = route_df.to_csv(index=False).encode("utf-8")
+                                st.download_button("⬇️ Download Route Plan (CSV)", csv_route, "outreach_route_plan.csv", "text/csv")
+                                m_route = folium.Map(location=[subset_coords[route_order[0]][0], subset_coords[route_order[0]][1]], zoom_start=10)
+                                folium.LayerControl().add_to(m_route)
+                                for i, v in enumerate(route_order):
+                                    folium.Marker([subset_coords[v][0], subset_coords[v][1]], popup=f"{i+1}. {v}", icon=folium.Icon(color="blue" if i == 0 else "green" if i == len(route_order)-1 else "orange", prefix="fa", icon=str(i+1))).add_to(m_route)
+                                folium.PolyLine([subset_coords[v] for v in route_order] + [subset_coords[route_order[0]]], color="#e74c3c", weight=4, opacity=0.8, dash_array="10, 5").add_to(m_route)
+                                st_folium(m_route, width=700, height=500)
                 else: st.info("ℹ️ Not enough geocoded villages for routing.")
             else: st.info("ℹ️ Insufficient data for routing.")
         else: st.info("ℹ️ Village data missing.")
